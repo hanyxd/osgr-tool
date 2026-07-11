@@ -1,58 +1,112 @@
-# OSGR - Instagram OSINT Reconnaissance Tool
+# osgr - Instagram OSINT Reconnaissance Tool
 
-Advanced Instagram profile analysis, story tracking, post analytics, and data export.
+Advanced Instagram profile analysis, story tracking, post analytics, and data export for OSINT investigations.
 
 ## Features
 
-- **Profile Analysis** - Complete profile info (followers, bio, verification, business status, etc.)
-- **Story Highlights** - Fetch all story highlights with items and URLs
-- **Active Stories** - Current 24h stories with expiration times
-- **Post Analytics** - Engagement rates, top hashtags, posting patterns, peak hours
-- **Follower/Following Analysis** - Sample analysis with influence metrics
-- **Comments Extraction** - Recent comments from posts
-- **Multiple Export Formats** - JSON, CSV, Markdown reports
+- **Profile Intelligence** — Username, bio, followers/following, verification, business category, profile pictures
+- **Post Analytics** — Likes, comments, hashtags, mentions, locations, engagement rates, posting patterns
+- **Story Tracking** — Active 24h stories + saved highlights with full metadata
+- **Likes Analysis** — Who liked specific posts (requires following target account)
+- **Follower/Following Sampling** — Export follower/following lists with metadata
+- **Comments Extraction** — Recent comments from posts
+- **Multiple Export Formats** — JSON, CSV, Markdown reports
 
 ## Installation
 
 ```bash
-# Requires Python 3.11+ and instaloader
+# Requires Python 3.8+ and instaloader
 pip install instaloader browser-cookie3
 
-# Login to Instagram in Chrome first (as the session user)
-# Then copy osgr to your PATH:
-cp osgr /usr/local/bin/osgr
-chmod +x /usr/local/bin/osgr
+# Clone and install
+git clone https://github.com/hanyxd/osgr-tool
+cd osgr-tool
+chmod +x osgr
+sudo ln -s $(pwd)/osgr /usr/local/bin/osgr
+```
+
+## Authentication
+
+Login to Instagram in **Chrome** as your investigation account (burner recommended), then osgr will automatically use those cookies:
+
+```bash
+# 1. Open Chrome → instagram.com → login
+# 2. Run osgr (it auto-detects Chrome session)
+osgr target_username
 ```
 
 ## Usage
 
 ```bash
 osgr <username> [options]
+```
 
-Options:
-  --analytics        Analyze recent posts (default: 30)
-  --stories          Include active 24h stories
-  --followers N      Sample N followers
-  --following N      Sample N following
-  --comments N       Comments from last N posts
-  --full             Everything (posts, highlights, stories, followers, following, comments)
-  --save             Save JSON + CSV + Markdown report
-  --csv              Save CSV exports
-  --json             Output raw JSON to stdout
-  --verbose          Verbose output with recent posts
+| Option | Description |
+|--------|-------------|
+| `--stories` | Fetch active 24h stories |
+| `--analytics` | Analyze last 30 posts (engagement, hashtags, timing) |
+| `--posts N` | Number of posts to analyze (default: 30) |
+| `--followers N` | Fetch N followers sample |
+| `--following N` | Fetch N following sample |
+| `--comments N` | Fetch comments from last N posts |
+| `--likes N` | Get likers for last N posts (requires following target) |
+| `--full` | Everything (posts + stories + highlights + followers + following + comments + likes) |
+| `--save` | Save JSON + CSV + Markdown report |
+| `--csv` | Save CSV exports only |
+| `--json` | Output raw JSON to stdout |
+| `--verbose, -v` | Verbose output with recent posts |
+| `--debug` | Debug mode |
 
-Examples:
-  osgr nasa --analytics --stories --save
-  osgr username --full --save
-  osgr username --followers 100 --csv
-  osgr username --json
+## Examples
+
+```bash
+# Basic profile + highlights
+osgr nasa
+
+# Profile + active stories
+osgr nasa --stories
+
+# Full analysis with exports
+osgr nasa --analytics --stories --save
+
+# Deep investigation
+osgr target --full --save
+
+# Get 100 followers + 50 following
+osgr target --followers 100 --following 50 --csv
+
+# Get likers for last 5 posts (must follow target first)
+osgr target --likes 5 --save
+
+# Raw JSON for piping
+osgr target --json | jq '.profile.followers'
 ```
 
 ## Output Files
 
-Saved to `/home/user/osgr_output/`:
-- `username_TIMESTAMP.json` - Complete structured data
-- `username_posts.csv` - Post analytics
-- `username_highlights.csv` - Story highlights
-- `username_followers.csv` - Followers sample
-- `username_report.md` - Human-readable markdown report
+Saved to `~/osgr_output/`:
+- `username_TIMESTAMP.json` — Complete structured data
+- `username_posts.csv` — Posts with all metadata
+- `username_highlights.csv` — Story highlights flattened
+- `username_followers.csv` — Follower sample
+- `username_report.md` — Human-readable Markdown report
+
+## Requirements
+
+- Python 3.8+
+- `instaloader` — `pip install instaloader`
+- `browser-cookie3` — `pip install browser-cookie3`
+- Chrome browser (for session cookies)
+- Instagram account (use burner!)
+
+## Legal & Ethics
+
+- **Educational/OSINT purposes only**
+- Use burner accounts — Instagram may challenge/lock automation
+- Respect rate limits and terms of service
+- Don't use on private accounts without permission
+- Check local laws regarding data collection
+
+## License
+
+MIT
