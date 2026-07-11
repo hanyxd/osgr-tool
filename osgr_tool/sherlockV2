@@ -1,0 +1,1883 @@
+#!/usr/bin/env python3
+"""
+sherlockV2 - Next-Gen Username OSINT Tool
+Modern async username enumeration with profile extraction, monitoring, and alerts.
+"""
+
+import asyncio
+import aiohttp
+import aiofiles
+import yaml
+import json
+import csv
+import sqlite3
+import argparse
+import sys
+import os
+import time
+import re
+import hashlib
+import secrets
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Set, Tuple
+from dataclasses import dataclass, field, asdict
+from urllib.parse import urljoin, urlparse
+from abc import ABC, abstractmethod
+import logging
+from logging.handlers import RotatingFileHandler
+from contextlib import asynccontextmanager
+import signal
+from dataclasses import dataclass
+from enum import Enum
+
+# Optional imports
+try:
+    import aiosqlite
+    HAS_AIOSQLITE = True
+except ImportError:
+    HAS_AIOSQLITE = False
+
+try:
+    from aiohttp_socks import ProxyConnector
+    HAS_SOCKS = True
+except ImportError:
+    HAS_SOCKS = False
+
+try:
+    from rich.console import Console
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.tree import Tree
+    from rich.live import Live
+    from rich import box
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+
+try:
+    import uvloop
+    uvloop.install()
+except ImportError:
+    pass
+
+# ─── Configuration ────────────────────────────────────────────────────────
+
+@dataclass
+class SiteConfig:
+    name: str
+    url: str
+    username_claimed: str
+    username_unclaimed: str
+    method: str = "GET"
+    headers: Dict[str, str] = field(default_factory=dict)
+    data: Dict[str, Any] = field(default_factory=dict)
+    cookies: Dict[str, str] = field(default_factory=dict)
+    auth: Optional[Dict[str, str]] = None
+    rate_limit: float = 1.0
+    timeout: int = 30
+    extractors: List[Dict[str, Any]] = field(default_factory=list)
+    error_type: str = "status_code"
+    error_values: List[Any] = field(default_factory=list)
+    blocked_indicators: List[str] = field(default_factory=list)
+    requires_login: bool = False
+    category: str = "general"
+    nsfw: bool = False
+    disabled: bool = False
+    priority: int = 50
+
+@dataclass
+class ProxyConfig:
+    url: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+    weight: int = 1
+
+@dataclass
+class AuthConfig:
+    site: str
+    type: str  # basic, bearer, cookie, form, oauth
+    credentials: Dict[str, str]
+
+@dataclass
+class NotificationConfig:
+    discord_webhook: Optional[str] = None
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
+    email_smtp: Optional[Dict[str, str]] = None
+    slack_webhook: Optional[str] = None
+    pushover_token: Optional[str] = None
+    pushover_user: Optional[str] = None
+    ntfy_topic: Optional[str] = None
+    only_on_new: bool = True
+
+@dataclass
+class AppConfig:
+    concurrency: int = 50
+    default_timeout: int = 30
+    default_rate_limit: float = 1.0
+    max_retries: int = 3
+    retry_backoff: float = 1.5
+    user_agents: List[str] = field(default_factory=lambda: [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+    ])
+    proxies: List[ProxyConfig] = field(default_factory=list)
+    auth: List[AuthConfig] = field(default_factory=list)
+    notifications: Optional[NotificationConfig] = None
+    database: str = "sqlite:///sherlockV2.db"
+    cache_ttl: int = 86400
+    output_dir: str = "./results"
+    log_level: str = "INFO"
+    log_file: str = "sherlockV2.log"
+
+# ─── Core Classes ─────────────────────────────────────────────────────────
+
+class ResultStatus(Enum):
+    CLAIMED = "claimed"
+    UNCLAIMED = "unclaimed"
+    ERROR = "error"
+    RATE_LIMITED = "rate_limited"
+    BLOCKED = "blocked"
+    UNKNOWN = "unknown"
+
+@dataclass
+class CheckResult:
+    site: str
+    username: str
+    status: ResultStatus
+    url: str
+    response_time: float
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    profile_data: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+    raw_response: Optional[str] = None
+    headers: Dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict:
+        d = asdict(self)
+        d['status'] = self.status.value
+        d['timestamp'] = self.timestamp.isoformat()
+        return d
+
+@dataclass
+class UsernameReport:
+    username: str
+    results: List[CheckResult] = field(default_factory=list)
+    started_at: datetime = field(default_factory=datetime.utcnow)
+    completed_at: Optional[datetime] = None
+    total_sites: int = 0
+    claimed_count: int = 0
+    unclaimed_count: int = 0
+    error_count: int = 0
+
+    def add_result(self, result: CheckResult):
+        self.results.append(result)
+        self.total_sites += 1
+        if result.status == ResultStatus.CLAIMED:
+            self.claimed_count += 1
+        elif result.status == ResultStatus.UNCLAIMED:
+            self.unclaimed_count += 1
+        else:
+            self.error_count += 1
+
+    def finish(self):
+        self.completed_at = datetime.utcnow()
+
+    def to_dict(self) -> Dict:
+        d = asdict(self)
+        d['started_at'] = self.started_at.isoformat()
+        d['completed_at'] = self.completed_at.isoformat() if self.completed_at else None
+        d['results'] = [r.to_dict() for r in self.results]
+        return d
+
+# ─── Site Registry ────────────────────────────────────────────────────────
+
+class SiteRegistry:
+    def __init__(self):
+        self.sites: Dict[str, SiteConfig] = {}
+        self._load_builtin()
+
+    def _load_builtin(self):
+        builtin = {
+            # Social Networks
+            "github": SiteConfig(
+                name="GitHub",
+                url="https://github.com/{username}",
+                username_claimed="@{username}",
+                username_unclaimed="404",
+                category="code",
+                extractors=[{"type": "regex", "pattern": r'<span class="p-name vcard-fullname d-block overflow-hidden">([^<]+)</span>', "field": "full_name"}],
+            ),
+            "gitlab": SiteConfig(
+                name="GitLab",
+                url="https://gitlab.com/{username}",
+                username_claimed="@{username}",
+                username_unclaimed="404",
+                category="code",
+            ),
+            "bitbucket": SiteConfig(
+                name="Bitbucket",
+                url="https://bitbucket.org/{username}/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="code",
+            ),
+            "twitter": SiteConfig(
+                name="Twitter/X",
+                url="https://x.com/{username}",
+                username_claimed="@{username}",
+                username_unclaimed="This account doesn't exist",
+                category="social",
+                rate_limit=2.0,
+            ),
+            "instagram": SiteConfig(
+                name="Instagram",
+                url="https://www.instagram.com/{username}/",
+                username_claimed="@{username}",
+                username_unclaimed="Sorry, this page isn't available",
+                category="social",
+                rate_limit=3.0,
+                requires_login=True,
+            ),
+            "facebook": SiteConfig(
+                name="Facebook",
+                url="https://www.facebook.com/{username}",
+                username_claimed="@{username}",
+                username_unclaimed="Page Not Found",
+                category="social",
+                rate_limit=3.0,
+                requires_login=True,
+            ),
+            "linkedin": SiteConfig(
+                name="LinkedIn",
+                url="https://www.linkedin.com/in/{username}",
+                username_claimed="{username}",
+                username_unclaimed="This page doesn't exist",
+                category="professional",
+                rate_limit=2.0,
+            ),
+            "reddit": SiteConfig(
+                name="Reddit",
+                url="https://www.reddit.com/user/{username}",
+                username_claimed="u/{username}",
+                username_unclaimed="Sorry, nobody on Reddit goes by that name",
+                category="social",
+            ),
+            "youtube": SiteConfig(
+                name="YouTube",
+                url="https://www.youtube.com/@{username}",
+                username_claimed="@{username}",
+                username_unclaimed="This page isn't available",
+                category="media",
+            ),
+            "tiktok": SiteConfig(
+                name="TikTok",
+                url="https://www.tiktok.com/@{username}",
+                username_claimed="@{username}",
+                username_unclaimed="Couldn't find this account",
+                category="media",
+            ),
+            "twitch": SiteConfig(
+                name="Twitch",
+                url="https://www.twitch.tv/{username}",
+                username_claimed="{username}",
+                username_unclaimed="This channel does not exist",
+                category="gaming",
+            ),
+            "discord": SiteConfig(
+                name="Discord",
+                url="https://discord.com/users/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="chat",
+                method="HEAD",
+            ),
+            "telegram": SiteConfig(
+                name="Telegram",
+                url="https://t.me/{username}",
+                username_claimed="@{username}",
+                username_unclaimed="If you have Telegram, you can contact",
+                category="chat",
+            ),
+            "snapchat": SiteConfig(
+                name="Snapchat",
+                url="https://www.snapchat.com/add/{username}",
+                username_claimed="Add @{username}",
+                username_unclaimed="User not found",
+                category="social",
+            ),
+            "pinterest": SiteConfig(
+                name="Pinterest",
+                url="https://www.pinterest.com/{username}/",
+                username_claimed="{username}",
+                username_unclaimed="Sorry, we couldn't find that page",
+                category="media",
+            ),
+            "tumblr": SiteConfig(
+                name="Tumblr",
+                url="https://{username}.tumblr.com/",
+                username_claimed="{username}",
+                username_unclaimed="There's nothing here",
+                category="blog",
+            ),
+            "medium": SiteConfig(
+                name="Medium",
+                url="https://medium.com/@{username}",
+                username_claimed="@{username}",
+                username_unclaimed="Page not found",
+                category="blog",
+            ),
+            "devto": SiteConfig(
+                name="Dev.to",
+                url="https://dev.to/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="tech",
+            ),
+            "hashnode": SiteConfig(
+                name="Hashnode",
+                url="https://{username}.hashnode.dev/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="tech",
+            ),
+            "stackoverflow": SiteConfig(
+                name="Stack Overflow",
+                url="https://stackoverflow.com/users/{username}",
+                username_claimed="{username}",
+                username_unclaimed="Page not found",
+                category="tech",
+            ),
+            "producthunt": SiteConfig(
+                name="Product Hunt",
+                url="https://www.producthunt.com/@{username}",
+                username_claimed="@{username}",
+                username_unclaimed="404",
+                category="tech",
+            ),
+            "angellist": SiteConfig(
+                name="AngelList",
+                url="https://angel.co/{username}",
+                username_claimed="@{username}",
+                username_unclaimed="404",
+                category="tech",
+            ),
+            "behance": SiteConfig(
+                name="Behance",
+                url="https://www.behance.net/{username}",
+                username_claimed="{username}",
+                username_unclaimed="Page not found",
+                category="design",
+            ),
+            "dribbble": SiteConfig(
+                name="Dribbble",
+                url="https://dribbble.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="design",
+            ),
+            "figma": SiteConfig(
+                name="Figma",
+                url="https://www.figma.com/@{username}",
+                username_claimed="@{username}",
+                username_unclaimed="404",
+                category="design",
+            ),
+            "codepen": SiteConfig(
+                name="CodePen",
+                url="https://codepen.io/{username}",
+                username_claimed="{username}",
+                username_unclaimed="Not Found",
+                category="code",
+            ),
+            "replit": SiteConfig(
+                name="Replit",
+                url="https://replit.com/@{username}",
+                username_claimed="@{username}",
+                username_unclaimed="404",
+                category="code",
+            ),
+            "codesandbox": SiteConfig(
+                name="CodeSandbox",
+                url="https://codesandbox.io/u/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="code",
+            ),
+            "npm": SiteConfig(
+                name="npm",
+                url="https://www.npmjs.com/~{username}",
+                username_claimed="{username}",
+                username_unclaimed="Not Found",
+                category="code",
+            ),
+            "pypi": SiteConfig(
+                name="PyPI",
+                url="https://pypi.org/user/{username}/",
+                username_claimed="{username}",
+                username_unclaimed="The page you're looking for doesn't exist",
+                category="code",
+            ),
+            "crates": SiteConfig(
+                name="Crates.io",
+                url="https://crates.io/users/{username}",
+                username_claimed="{username}",
+                username_unclaimed="Not Found",
+                category="code",
+            ),
+            "docker": SiteConfig(
+                name="Docker Hub",
+                url="https://hub.docker.com/u/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="code",
+            ),
+            "keybase": SiteConfig(
+                name="Keybase",
+                url="https://keybase.io/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="security",
+            ),
+            "hackerone": SiteConfig(
+                name="HackerOne",
+                url="https://hackerone.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="security",
+            ),
+            "bugcrowd": SiteConfig(
+                name="Bugcrowd",
+                url="https://bugcrowd.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="security",
+            ),
+            "tryhackme": SiteConfig(
+                name="TryHackMe",
+                url="https://tryhackme.com/p/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="security",
+            ),
+            "hackthebox": SiteConfig(
+                name="Hack The Box",
+                url="https://app.hackthebox.com/profile/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="security",
+            ),
+            "rootme": SiteConfig(
+                name="Root-Me",
+                url="https://www.root-me.org/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="security",
+            ),
+            "vulnweb": SiteConfig(
+                name="VulnWeb",
+                url="https://vulnweb.com/user/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="security",
+            ),
+            "spotify": SiteConfig(
+                name="Spotify",
+                url="https://open.spotify.com/user/{username}",
+                username_claimed="{username}",
+                username_unclaimed="Page not found",
+                category="media",
+            ),
+            "soundcloud": SiteConfig(
+                name="SoundCloud",
+                url="https://soundcloud.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="media",
+            ),
+            "bandcamp": SiteConfig(
+                name="Bandcamp",
+                url="https://{username}.bandcamp.com",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="media",
+            ),
+            "mixcloud": SiteConfig(
+                name="Mixcloud",
+                url="https://www.mixcloud.com/{username}/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="media",
+            ),
+            "vimeo": SiteConfig(
+                name="Vimeo",
+                url="https://vimeo.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="Page not found",
+                category="media",
+            ),
+            "dailymotion": SiteConfig(
+                name="Dailymotion",
+                url="https://www.dailymotion.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="This page does not exist",
+                category="media",
+            ),
+            "flickr": SiteConfig(
+                name="Flickr",
+                url="https://www.flickr.com/people/{username}/",
+                username_claimed="{username}",
+                username_unclaimed="Page not found",
+                category="media",
+            ),
+            "500px": SiteConfig(
+                name="500px",
+                url="https://500px.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="media",
+            ),
+            "unsplash": SiteConfig(
+                name="Unsplash",
+                url="https://unsplash.com/@{username}",
+                username_claimed="@{username}",
+                username_unclaimed="404",
+                category="media",
+            ),
+            "deviantart": SiteConfig(
+                name="DeviantArt",
+                url="https://www.deviantart.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="Page not found",
+                category="art",
+            ),
+            "artstation": SiteConfig(
+                name="ArtStation",
+                url="https://www.artstation.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="art",
+            ),
+            "behance": SiteConfig(
+                name="Behance",
+                url="https://www.behance.net/{username}",
+                username_claimed="{username}",
+                username_unclaimed="Page not found",
+                category="art",
+            ),
+            "cargocollective": SiteConfig(
+                name="Cargo Collective",
+                url="https://{username}.cargocollective.com",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="art",
+            ),
+            "etsy": SiteConfig(
+                name="Etsy",
+                url="https://www.etsy.com/shop/{username}",
+                username_claimed="{username}",
+                username_unclaimed="We couldn't find that shop",
+                category="shop",
+            ),
+            "ebay": SiteConfig(
+                name="eBay",
+                url="https://www.ebay.com/usr/{username}",
+                username_claimed="{username}",
+                username_unclaimed="Page not found",
+                category="shop",
+            ),
+            "amazon": SiteConfig(
+                name="Amazon",
+                url="https://www.amazon.com/shop/{username}",
+                username_claimed="{username}",
+                username_unclaimed="Page not found",
+                category="shop",
+            ),
+            "patreon": SiteConfig(
+                name="Patreon",
+                url="https://www.patreon.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="This page doesn't exist",
+                category="creator",
+            ),
+            "kofi": SiteConfig(
+                name="Ko-fi",
+                url="https://ko-fi.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="Page not found",
+                category="creator",
+            ),
+            "buymeacoffee": SiteConfig(
+                name="Buy Me a Coffee",
+                url="https://www.buymeacoffee.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="creator",
+            ),
+            "liberapay": SiteConfig(
+                name="Liberapay",
+                url="https://liberapay.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="creator",
+            ),
+            "opencollective": SiteConfig(
+                name="Open Collective",
+                url="https://opencollective.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="creator",
+            ),
+            "gumroad": SiteConfig(
+                name="Gumroad",
+                url="https://gumroad.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="Page not found",
+                category="creator",
+            ),
+            "itch": SiteConfig(
+                name="itch.io",
+                url="https://{username}.itch.io",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="gaming",
+            ),
+            "steam": SiteConfig(
+                name="Steam",
+                url="https://steamcommunity.com/id/{username}",
+                username_claimed="{username}",
+                username_unclaimed="The specified profile could not be found",
+                category="gaming",
+            ),
+            "xbox": SiteConfig(
+                name="Xbox",
+                url="https://xboxgamertag.com/search/{username}",
+                username_claimed="{username}",
+                username_unclaimed="No results found",
+                category="gaming",
+            ),
+            "playstation": SiteConfig(
+                name="PlayStation",
+                url="https://psnprofiles.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="gaming",
+            ),
+            "battlenet": SiteConfig(
+                name="Battle.net",
+                url="https://battle.net/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="gaming",
+            ),
+            "epicgames": SiteConfig(
+                name="Epic Games",
+                url="https://www.epicgames.com/id/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="gaming",
+            ),
+            "origin": SiteConfig(
+                name="Origin/EA",
+                url="https://www.origin.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="gaming",
+            ),
+            "uplay": SiteConfig(
+                name="Ubisoft Connect",
+                url="https://connect.ubisoft.com/profile/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="gaming",
+            ),
+            "gog": SiteConfig(
+                name="GOG",
+                url="https://www.gog.com/u/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="gaming",
+            ),
+            "riot": SiteConfig(
+                name="Riot Games",
+                url="https://www.riotgames.com/en/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="gaming",
+            ),
+            "minecraft": SiteConfig(
+                name="Minecraft",
+                url="https://www.minecraft.net/profile/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="gaming",
+            ),
+            "roblox": SiteConfig(
+                name="Roblox",
+                url="https://www.roblox.com/user.aspx?username={username}",
+                username_claimed="{username}",
+                username_unclaimed="User not found",
+                category="gaming",
+            ),
+            "discordapp": SiteConfig(
+                name="Discord (old)",
+                url="https://discordapp.com/users/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="chat",
+            ),
+            "slack": SiteConfig(
+                name="Slack",
+                url="https://{username}.slack.com",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="chat",
+            ),
+            "matrix": SiteConfig(
+                name="Matrix",
+                url="https://matrix.to/#/@{username}:matrix.org",
+                username_claimed="@{username}:matrix.org",
+                username_unclaimed="User not found",
+                category="chat",
+            ),
+            "signal": SiteConfig(
+                name="Signal",
+                url="https://signal.me/#p/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="chat",
+            ),
+            "threema": SiteConfig(
+                name="Threema",
+                url="https://threema.ch/id/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="chat",
+            ),
+            "wire": SiteConfig(
+                name="Wire",
+                url="https://wire.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="chat",
+            ),
+            "keybase": SiteConfig(
+                name="Keybase",
+                url="https://keybase.io/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="security",
+            ),
+            "protonmail": SiteConfig(
+                name="ProtonMail",
+                url="https://proton.me/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="security",
+            ),
+            "tutanota": SiteConfig(
+                name="Tutanota",
+                url="https://tutanota.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="security",
+            ),
+            "githubgist": SiteConfig(
+                name="GitHub Gist",
+                url="https://gist.github.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="code",
+            ),
+            "gitlabsnippets": SiteConfig(
+                name="GitLab Snippets",
+                url="https://gitlab.com/snippets/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="code",
+            ),
+            "pastebin": SiteConfig(
+                name="Pastebin",
+                url="https://pastebin.com/u/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="code",
+            ),
+            "replit": SiteConfig(
+                name="Replit",
+                url="https://replit.com/@{username}",
+                username_claimed="@{username}",
+                username_unclaimed="404",
+                category="code",
+            ),
+            "glitch": SiteConfig(
+                name="Glitch",
+                url="https://glitch.com/@{username}",
+                username_claimed="@{username}",
+                username_unclaimed="404",
+                category="code",
+            ),
+            "codesandbox": SiteConfig(
+                name="CodeSandbox",
+                url="https://codesandbox.io/u/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="code",
+            ),
+            "stackblitz": SiteConfig(
+                name="StackBlitz",
+                url="https://stackblitz.com/@{username}",
+                username_claimed="@{username}",
+                username_unclaimed="404",
+                category="code",
+            ),
+            "jsfiddle": SiteConfig(
+                name="JSFiddle",
+                url="https://jsfiddle.net/user/{username}/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="code",
+            ),
+            "codepen": SiteConfig(
+                name="CodePen",
+                url="https://codepen.io/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="code",
+            ),
+            "hashnode": SiteConfig(
+                name="Hashnode",
+                url="https://{username}.hashnode.dev/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="blog",
+            ),
+            "substack": SiteConfig(
+                name="Substack",
+                url="https://{username}.substack.com/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="blog",
+            ),
+            "ghost": SiteConfig(
+                name="Ghost",
+                url="https://{username}.ghost.io/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="blog",
+            ),
+            "wordpress": SiteConfig(
+                name="WordPress",
+                url="https://{username}.wordpress.com/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="blog",
+            ),
+            "blogger": SiteConfig(
+                name="Blogger",
+                url="https://{username}.blogspot.com/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="blog",
+            ),
+            "writeas": SiteConfig(
+                name="Write.as",
+                url="https://write.as/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="blog",
+            ),
+            "notion": SiteConfig(
+                name="Notion",
+                url="https://{username}.notion.site/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="productivity",
+            ),
+            "obsidian": SiteConfig(
+                name="Obsidian Publish",
+                url="https://publish.obsidian.md/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="productivity",
+            ),
+            "readthedocs": SiteConfig(
+                name="Read the Docs",
+                url="https://readthedocs.org/projects/{username}/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="docs",
+            ),
+            "gitbook": SiteConfig(
+                name="GitBook",
+                url="https://{username}.gitbook.io/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="docs",
+            ),
+            "confluence": SiteConfig(
+                name="Confluence",
+                url="https://{username}.atlassian.net/wiki/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="docs",
+            ),
+            "jira": SiteConfig(
+                name="Jira",
+                url="https://{username}.atlassian.net/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="project",
+            ),
+            "trello": SiteConfig(
+                name="Trello",
+                url="https://trello.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="project",
+            ),
+            "notionprofile": SiteConfig(
+                name="Notion Profile",
+                url="https://www.notion.so/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="productivity",
+            ),
+            "airtable": SiteConfig(
+                name="Airtable",
+                url="https://airtable.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="productivity",
+            ),
+            "zapier": SiteConfig(
+                name="Zapier",
+                url="https://zapier.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="automation",
+            ),
+            "ifttt": SiteConfig(
+                name="IFTTT",
+                url="https://ifttt.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="automation",
+            ),
+            "n8n": SiteConfig(
+                name="n8n",
+                url="https://{username}.n8n.cloud/",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="automation",
+            ),
+            "vercel": SiteConfig(
+                name="Vercel",
+                url="https://vercel.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="hosting",
+            ),
+            "netlify": SiteConfig(
+                name="Netlify",
+                url="https://app.netlify.com/teams/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="hosting",
+            ),
+            "heroku": SiteConfig(
+                name="Heroku",
+                url="https://dashboard.heroku.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="hosting",
+            ),
+            "digitalocean": SiteConfig(
+                name="DigitalOcean",
+                url="https://cloud.digitalocean.com/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="hosting",
+            ),
+            "aws": SiteConfig(
+                name="AWS",
+                url="https://console.aws.amazon.com/iam/home?#/users/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="cloud",
+            ),
+            "gcp": SiteConfig(
+                name="Google Cloud",
+                url="https://console.cloud.google.com/iam-admin/users/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="cloud",
+            ),
+            "azure": SiteConfig(
+                name="Azure",
+                url="https://portal.azure.com/#blade/Microsoft_AAD_IAM/UsersManagementMenuBlade/AllUsers/{username}",
+                username_claimed="{username}",
+                username_unclaimed="404",
+                category="cloud",
+            ),
+        }
+        for k, v in builtin.items():
+            self.register(k, v)
+
+    def register(self, key: str, config: SiteConfig):
+        self.sites[key] = config
+
+    def unregister(self, key: str):
+        self.sites.pop(key, None)
+
+    def enable(self, key: str):
+        if key in self.sites:
+            self.sites[key].disabled = False
+
+    def disable(self, key: str):
+        if key in self.sites:
+            self.sites[key].disabled = True
+
+    def get(self, key: str) -> Optional[SiteConfig]:
+        return self.sites.get(key)
+
+    def list(self, enabled_only: bool = True, category: Optional[str] = None) -> List[SiteConfig]:
+        sites = list(self.sites.values())
+        if enabled_only:
+            sites = [s for s in sites if not s.disabled]
+        if category:
+            sites = [s for s in sites if s.category == category]
+        return sorted(sites, key=lambda s: -s.priority)
+
+    def categories(self) -> List[str]:
+        return sorted(set(s.category for s in self.sites.values()))
+
+    def load_from_file(self, path: Path):
+        data = yaml.safe_load(path.read_text())
+        for key, config in data.get("sites", {}).items():
+            self.register(key, SiteConfig(**config))
+
+# ─── Rate Limiter ─────────────────────────────────────────────────────────
+
+class RateLimiter:
+    def __init__(self, default_rate: float = 1.0):
+        self.default_rate = default_rate
+        self.last_request: Dict[str, float] = {}
+        self.lock = asyncio.Lock()
+
+    async def wait(self, site: str, rate: float = None):
+        rate = rate or self.default_rate
+        async with self.lock:
+            now = time.monotonic()
+            last = self.last_request.get(site, 0)
+            elapsed = now - last
+            if elapsed < rate:
+                await asyncio.sleep(rate - elapsed)
+            self.last_request[site] = time.monotonic()
+
+# ─── HTTP Client ──────────────────────────────────────────────────────────
+
+class HTTPClient:
+    def __init__(self, config: AppConfig, rate_limiter: RateLimiter):
+        self.config = config
+        self.rate_limiter = rate_limiter
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.proxy_pool: List[str] = [p.url for p in config.proxies]
+
+    async def __aenter__(self):
+        connector = None
+        if self.proxy_pool and HAS_SOCKS:
+            connector = ProxyConnector.from_url(self.proxy_pool[0])
+        elif self.proxy_pool:
+            connector = aiohttp.TCPConnector(limit=100)
+
+        timeout = aiohttp.ClientTimeout(total=self.config.default_timeout)
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={"User-Agent": secrets.choice(self.config.user_agents)},
+            cookie_jar=aiohttp.CookieJar(unsafe=True),
+        )
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+
+    def _get_proxy(self) -> Optional[str]:
+        if not self.proxy_pool:
+            return None
+        return secrets.choice(self.proxy_pool)
+
+    def _get_auth(self, site: str) -> Optional[aiohttp.BasicAuth]:
+        for auth in self.config.auth:
+            if auth.site == site:
+                if auth.type == "basic":
+                    return aiohttp.BasicAuth(auth.credentials["username"], auth.credentials["password"])
+        return None
+
+    async def request(self, site_config: SiteConfig, username: str) -> Tuple[CheckResult, Optional[aiohttp.ClientResponse]]:
+        url = site_config.url.format(username=username)
+        method = site_config.method.upper()
+        headers = {**site_config.headers}
+        cookies = {**site_config.cookies}
+        data = site_config.data.copy() if site_config.data else None
+        auth = self._get_auth(site_config.name)
+
+        # Apply auth headers
+        for auth_cfg in self.config.auth:
+            if auth_cfg.site == site_config.name:
+                if auth_cfg.type == "bearer":
+                    headers["Authorization"] = f"Bearer {auth_cfg.credentials['token']}"
+                elif auth_cfg.type == "cookie":
+                    cookies.update(auth_cfg.credentials)
+
+        await self.rate_limiter.wait(site_config.name, site_config.rate_limit)
+
+        start = time.monotonic()
+        try:
+            async with self.session.request(
+                method, url, headers=headers, cookies=cookies, data=data, auth=auth,
+                allow_redirects=True
+            ) as resp:
+                response_time = time.monotonic() - start
+                text = await resp.text()
+                return CheckResult(
+                    site=site_config.name,
+                    username=username,
+                    status=ResultStatus.UNKNOWN,
+                    url=str(resp.url),
+                    response_time=response_time,
+                    headers=dict(resp.headers),
+                    raw_response=text[:5000],
+                ), resp
+        except asyncio.TimeoutError:
+            return CheckResult(
+                site=site_config.name,
+                username=username,
+                status=ResultStatus.ERROR,
+                url=url,
+                response_time=time.monotonic() - start,
+                error="Timeout",
+            ), None
+        except aiohttp.ClientError as e:
+            return CheckResult(
+                site=site_config.name,
+                username=username,
+                status=ResultStatus.ERROR,
+                url=url,
+                response_time=time.monotonic() - start,
+                error=str(e),
+            ), None
+        except Exception as e:
+            return CheckResult(
+                site=site_config.name,
+                username=username,
+                status=ResultStatus.ERROR,
+                url=url,
+                response_time=time.monotonic() - start,
+                error=f"Unexpected: {e}",
+            ), None
+
+# ─── Extractors ───────────────────────────────────────────────────────────
+
+class Extractor(ABC):
+    @abstractmethod
+    def extract(self, html: str, url: str) -> Dict[str, Any]:
+        pass
+
+class RegexExtractor(Extractor):
+    def __init__(self, pattern: str, field: str, group: int = 1):
+        self.pattern = re.compile(pattern)
+        self.field = field
+        self.group = group
+
+    def extract(self, html: str, url: str) -> Dict[str, Any]:
+        match = self.pattern.search(html)
+        if match:
+            return {self.field: match.group(self.group)}
+        return {}
+
+class JSONExtractor(Extractor):
+    def __init__(self, path: str, field: str):
+        self.path = path.split(".")
+        self.field = field
+
+    def extract(self, html: str, url: str) -> Dict[str, Any]:
+        try:
+            data = json.loads(html)
+            for key in self.path:
+                data = data[key]
+            return {self.field: data}
+        except Exception:
+            return {}
+
+class MetaExtractor(Extractor):
+    def extract(self, html: str, url: str) -> Dict[str, Any]:
+        result = {}
+        for prop, field in [
+            ("og:title", "title"),
+            ("og:description", "description"),
+            ("og:image", "image"),
+            ("og:url", "canonical_url"),
+            ("twitter:card", "twitter_card"),
+            ("twitter:site", "twitter_site"),
+            ("twitter:creator", "twitter_creator"),
+        ]:
+            pattern = rf'<meta property="{prop}" content="([^"]+)"'
+            match = re.search(pattern, html)
+            if match:
+                result[field] = match.group(1)
+        return result
+
+class SchemaExtractor(Extractor):
+    def extract(self, html: str, url: str) -> Dict[str, Any]:
+        result = {}
+        # JSON-LD
+        for match in re.finditer(r'<script type="application/ld\+json">(.*?)</script>', html, re.DOTALL):
+            try:
+                data = json.loads(match.group(1))
+                if isinstance(data, list):
+                    data = data[0]
+                if isinstance(data, dict):
+                    result.update({
+                        "name": data.get("name"),
+                        "description": data.get("description"),
+                        "url": data.get("url"),
+                        "image": data.get("image"),
+                        "sameAs": data.get("sameAs"),
+                    })
+            except Exception:
+                pass
+        return result
+
+EXTRACTORS = {
+    "regex": lambda c: RegexExtractor(c["pattern"], c["field"], c.get("group", 1)),
+    "json": lambda c: JSONExtractor(c["path"], c["field"]),
+    "meta": lambda _: MetaExtractor(),
+    "schema": lambda _: SchemaExtractor(),
+}
+
+# ─── Site Checker ─────────────────────────────────────────────────────────
+
+class SiteChecker:
+    def __init__(self, client: HTTPClient, registry: SiteRegistry):
+        self.client = client
+        self.registry = registry
+
+    async def check(self, site_key: str, username: str) -> CheckResult:
+        site = self.registry.get(site_key)
+        if not site or site.disabled:
+            return CheckResult(
+                site=site_key, username=username,
+                status=ResultStatus.UNKNOWN, url="", response_time=0,
+                error="Site not found or disabled"
+            )
+
+        result, response = await self.client.request(site, username)
+        if not response:
+            return result
+
+        # Determine status
+        result = await self._evaluate_status(site, username, result, response)
+        return result
+
+    async def _evaluate_status(self, site: SiteConfig, username: str,
+                                result: CheckResult, response: aiohttp.ClientResponse) -> CheckResult:
+        html = result.raw_response or ""
+
+        # Check for blocked indicators
+        for indicator in site.blocked_indicators:
+            if indicator in html:
+                result.status = ResultStatus.BLOCKED
+                result.error = f"Blocked: {indicator}"
+                return result
+
+        # Rate limiting
+        if response.status == 429:
+            result.status = ResultStatus.RATE_LIMITED
+            result.error = "Rate limited"
+            return result
+
+        # Error-based detection
+        if site.error_type == "status_code":
+            if response.status == 404:
+                result.status = ResultStatus.UNCLAIMED
+            elif response.status == 200:
+                result.status = ResultStatus.CLAIMED
+            else:
+                result.status = ResultStatus.ERROR
+                result.error = f"HTTP {response.status}"
+
+        elif site.error_type == "text_contains":
+            if any(val in html for val in site.error_values):
+                result.status = ResultStatus.UNCLAIMED
+            else:
+                result.status = ResultStatus.CLAIMED
+
+        elif site.error_type == "text_not_contains":
+            if all(val not in html for val in site.error_values):
+                result.status = ResultStatus.CLAIMED
+            else:
+                result.status = ResultStatus.UNCLAIMED
+
+        elif site.error_type == "regex":
+            for pattern in site.error_values:
+                if re.search(pattern, html):
+                    result.status = ResultStatus.UNCLAIMED
+                    break
+            else:
+                result.status = ResultStatus.CLAIMED
+
+        # Extract profile data if claimed
+        if result.status == ResultStatus.CLAIMED:
+            result.profile_data = await self._extract_profile(site, result.raw_response or "", str(response.url))
+
+        return result
+
+    async def _extract_profile(self, site: SiteConfig, html: str, url: str) -> Dict[str, Any]:
+        data = {}
+        for extractor_config in site.extractors:
+            try:
+                extractor = EXTRACTORS[extractor_config["type"]](extractor_config)
+                data.update(extractor.extract(html, url))
+            except Exception:
+                pass
+        return data
+
+    async def check_multiple(self, sites: List[str], username: str,
+                             progress_callback: Optional[callable] = None) -> List[CheckResult]:
+        semaphore = asyncio.Semaphore(self.client.config.concurrency)
+
+        async def check_one(site_key: str):
+            async with semaphore:
+                return await self.check(site_key, username)
+
+        tasks = [check_one(site) for site in sites]
+        results = []
+
+        for coro in asyncio.as_completed(tasks):
+            result = await coro
+            results.append(result)
+            if progress_callback:
+                await progress_callback(result)
+
+        return results
+
+# ─── Database ─────────────────────────────────────────────────────────────
+
+class Database:
+    def __init__(self, db_path: str):
+        self.db_path = db_path.replace("sqlite:///", "")
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS checks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    site TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    url TEXT,
+                    response_time REAL,
+                    timestamp TEXT NOT NULL,
+                    profile_data TEXT,
+                    error TEXT,
+                    UNIQUE(username, site)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_username ON checks(username)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_site ON checks(site)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON checks(timestamp)")
+
+    async def save_result(self, result: CheckResult):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO checks
+                (username, site, status, url, response_time, timestamp, profile_data, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                result.username, result.site, result.status.value,
+                result.url, result.response_time,
+                result.timestamp.isoformat(),
+                json.dumps(result.profile_data),
+                result.error
+            ))
+            await db.commit()
+
+    async def get_history(self, username: str, site: Optional[str] = None, limit: int = 100) -> List[Dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            query = "SELECT * FROM checks WHERE username = ?"
+            params = [username]
+            if site:
+                query += " AND site = ?"
+                params.append(site)
+            query += " ORDER BY timestamp DESC LIMIT ?"
+            params.append(limit)
+            cursor = await db.execute(query, params)
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_stats(self) -> Dict:
+        async with aiosqlite.connect(self.db_path) as db:
+            stats = {}
+            stats["total_checks"] = (await db.execute("SELECT COUNT(*) FROM checks")).fetchone()[0]
+            stats["unique_usernames"] = (await db.execute("SELECT COUNT(DISTINCT username) FROM checks")).fetchone()[0]
+            stats["unique_sites"] = (await db.execute("SELECT COUNT(DISTINCT site) FROM checks")).fetchone()[0]
+            stats["claimed"] = (await db.execute("SELECT COUNT(*) FROM checks WHERE status = 'claimed'")).fetchone()[0]
+            stats["unclaimed"] = (await db.execute("SELECT COUNT(*) FROM checks WHERE status = 'unclaimed'")).fetchone()[0]
+            return stats
+
+# ─── Notifications ────────────────────────────────────────────────────────
+
+class Notifier:
+    def __init__(self, config: NotificationConfig):
+        self.config = config
+        self.http: Optional[aiohttp.ClientSession] = None
+
+    async def __aenter__(self):
+        self.http = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, *args):
+        if self.http:
+            await self.http.close()
+
+    async def notify(self, message: str, report: UsernameReport):
+        tasks = []
+        if self.config.discord_webhook:
+            tasks.append(self._discord(message, report))
+        if self.config.telegram_bot_token and self.config.telegram_chat_id:
+            tasks.append(self._telegram(message, report))
+        if self.config.slack_webhook:
+            tasks.append(self._slack(message, report))
+        if self.config.ntfy_topic:
+            tasks.append(self._ntfy(message, report))
+        if self.config.pushover_token and self.config.pushover_user:
+            tasks.append(self._pushover(message, report))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _format_report(self, report: UsernameReport) -> str:
+        lines = [f"🔍 **{report.username}** - Scan Complete"]
+        lines.append(f"✅ Claimed: {report.claimed_count} | ❌ Unclaimed: {report.unclaimed_count} | ⚠️ Errors: {report.error_count}")
+        for r in report.results:
+            if r.status == ResultStatus.CLAIMED:
+                lines.append(f"  ✅ {r.site}: {r.url}")
+        return "\n".join(lines)
+
+    async def _discord(self, message: str, report: UsernameReport):
+        content = self._format_report(report)
+        await self.http.post(self.config.discord_webhook, json={"content": content})
+
+    async def _telegram(self, message: str, report: UsernameReport):
+        content = self._format_report(report)
+        url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendMessage"
+        await self.http.post(url, json={"chat_id": self.config.telegram_chat_id, "text": content, "parse_mode": "Markdown"})
+
+    async def _slack(self, message: str, report: UsernameReport):
+        content = self._format_report(report)
+        await self.http.post(self.config.slack_webhook, json={"text": content})
+
+    async def _ntfy(self, message: str, report: UsernameReport):
+        content = self._format_report(report)
+        await self.http.post(f"https://ntfy.sh/{self.config.ntfy_topic}", data=content)
+
+    async def _pushover(self, message: str, report: UsernameReport):
+        content = self._format_report(report)
+        await self.http.post("https://api.pushover.net/1/messages.json", data={
+            "token": self.config.pushover_token,
+            "user": self.config.pushover_user,
+            "message": content,
+        })
+
+# ─── Output Writers ───────────────────────────────────────────────────────
+
+class OutputWriter:
+    def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def write(self, report: UsernameReport, formats: List[str]):
+        timestamp = report.started_at.strftime("%Y%m%d_%H%M%S")
+        base = self.output_dir / f"{report.username}_{timestamp}"
+
+        for fmt in formats:
+            if fmt == "json":
+                self._write_json(base, report)
+            elif fmt == "csv":
+                self._write_csv(base, report)
+            elif fmt == "xlsx":
+                self._write_xlsx(base, report)
+            elif fmt == "md":
+                self._write_md(base, report)
+            elif fmt == "html":
+                self._write_html(base, report)
+            elif fmt == "sqlite":
+                self._write_sqlite(base, report)
+
+    def _write_json(self, base: Path, report: UsernameReport):
+        (base.with_suffix(".json")).write_text(json.dumps(report.to_dict(), indent=2))
+
+    def _write_csv(self, base: Path, report: UsernameReport):
+        with open(base.with_suffix(".csv"), "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "site", "username", "status", "url", "response_time",
+                "timestamp", "error", "profile_data"
+            ])
+            writer.writeheader()
+            for r in report.results:
+                row = r.to_dict()
+                # Remove extra fields
+                row.pop("headers", None)
+                row.pop("raw_response", None)
+                row["profile_data"] = json.dumps(row["profile_data"])
+                writer.writerow(row)
+
+    def _write_xlsx(self, base: Path, report: UsernameReport):
+        try:
+            import openpyxl
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Results"
+            headers = ["Site", "Username", "Status", "URL", "Response Time", "Timestamp", "Error", "Profile Data"]
+            ws.append(headers)
+            for r in report.results:
+                row = r.to_dict()
+                row["profile_data"] = json.dumps(row["profile_data"])
+                ws.append([row.get(h.lower().replace(" ", "_"), "") for h in headers])
+            wb.save(base.with_suffix(".xlsx"))
+        except ImportError:
+            pass
+
+    def _write_md(self, base: Path, report: UsernameReport):
+        lines = [
+            f"# OSINT Report: @{report.username}",
+            f"Generated: {report.started_at.isoformat()}",
+            f"Completed: {report.completed_at.isoformat() if report.completed_at else 'N/A'}",
+            "",
+            f"## Summary",
+            f"- **Total Sites:** {report.total_sites}",
+            f"- **✅ Claimed:** {report.claimed_count}",
+            f"- **❌ Unclaimed:** {report.unclaimed_count}",
+            f"- **⚠️ Errors:** {report.error_count}",
+            "",
+            "## Results",
+            "| Site | Status | URL | Response Time | Error |",
+            "|------|--------|-----|---------------|-------|",
+        ]
+        for r in sorted(report.results, key=lambda x: x.site):
+            status_emoji = {"claimed": "✅", "unclaimed": "❌", "error": "⚠️", "rate_limited": "🚫", "blocked": "🛑"}.get(r.status.value, "❓")
+            error = r.error or ""
+            lines.append(f"| {r.site} | {status_emoji} {r.status.value} | {r.url} | {r.response_time:.2f}s | {error} |")
+
+        (base.with_suffix(".md")).write_text("\n".join(lines))
+
+    def _write_html(self, base: Path, report: UsernameReport):
+        html = f"""<!DOCTYPE html>
+<html><head><title>OSINT Report: @{report.username}</title>
+<style>
+body {{ font-family: system-ui; max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }}
+table {{ width: 100%; border-collapse: collapse; }}
+th, td {{ padding: 0.5rem; border: 1px solid #ddd; text-align: left; }}
+th {{ background: #f5f5f5; }}
+.claimed {{ color: green; }} .unclaimed {{ color: red; }}
+.error {{ color: orange; }} .rate_limited {{ color: purple; }}
+.blocked {{ color: darkred; }}
+tr:hover {{ background: #f9f9f9; }}
+</style></head><body>
+<h1>OSINT Report: @{report.username}</h1>
+<p>Generated: {report.started_at.isoformat()}</p>
+<p>Total: {report.total_sites} | Claimed: {report.claimed_count} | Unclaimed: {report.unclaimed_count} | Errors: {report.error_count}</p>
+<table><thead><tr><th>Site</th><th>Status</th><th>URL</th><th>Response Time</th><th>Error</th></tr></thead><tbody>
+"""
+        for r in sorted(report.results, key=lambda x: x.site):
+            status_class = r.status.value
+            error = r.error or ""
+            html += f"<tr><td>{r.site}</td><td class='{status_class}'>{r.status.value}</td><td><a href='{r.url}' target='_blank'>{r.url}</a></td><td>{r.response_time:.2f}s</td><td>{error}</td></tr>"
+        html += "</tbody></table></body></html>"
+        (base.with_suffix(".html")).write_text(html)
+
+    def _write_sqlite(self, base: Path, report: UsernameReport):
+        db = sqlite3.connect(base.with_suffix(".sqlite"))
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT, site TEXT, status TEXT, url TEXT,
+                response_time REAL, timestamp TEXT, profile_data TEXT, error TEXT
+            )
+        """)
+        for r in report.results:
+            db.execute("""
+                INSERT INTO results VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (r.username, r.site, r.status.value, r.url, r.response_time,
+                  r.timestamp.isoformat(), json.dumps(r.profile_data), r.error))
+        db.commit()
+        db.close()
+
+# ─── Main Engine ──────────────────────────────────────────────────────────
+
+class SherlockX:
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.registry = SiteRegistry()
+        self.rate_limiter = RateLimiter(config.default_rate_limit)
+        self.db = Database(config.database)
+        self._setup_logging()
+
+    def _setup_logging(self):
+        log_level = getattr(logging, self.config.log_level.upper())
+        handlers = [logging.StreamHandler(sys.stdout)]
+        if self.config.log_file:
+            handlers.append(RotatingFileHandler(self.config.log_file, maxBytes=10*1024*1024, backupCount=5))
+        logging.basicConfig(level=log_level, format="%(asctime)s | %(levelname)s | %(message)s", handlers=handlers)
+        self.logger = logging.getLogger("sherlockV2")
+
+    async def scan(self, usernames: List[str], sites: Optional[List[str]] = None,
+                   categories: Optional[List[str]] = None, formats: List[str] = None,
+                   progress: bool = True) -> List[UsernameReport]:
+        formats = formats or ["json", "csv", "md"]
+        target_sites = self._resolve_sites(sites, categories)
+
+        async with HTTPClient(self.config, self.rate_limiter) as client:
+            checker = SiteChecker(client, self.registry)
+            writer = OutputWriter(Path(self.config.output_dir))
+
+            if progress and HAS_RICH:
+                return await self._scan_with_rich_progress(usernames, target_sites, checker, writer, formats)
+            else:
+                return await self._scan_simple(usernames, target_sites, checker, writer, formats)
+
+    def _resolve_sites(self, sites: Optional[List[str]], categories: Optional[List[str]]) -> List[str]:
+        if sites:
+            return [s for s in sites if s in self.registry.sites]
+        if categories:
+            return [s.name for s in self.registry.list(category=categories[0])]
+        return [s.name for s in self.registry.list()]
+
+    async def _scan_simple(self, usernames, sites, checker, writer, formats):
+        reports = []
+        for username in usernames:
+            report = await self._scan_username(username, sites, checker)
+            writer.write(report, formats)
+            await self._save_to_db(report)
+            reports.append(report)
+        return reports
+
+    async def _scan_with_rich_progress(self, usernames, sites, checker, writer, formats):
+        console = Console()
+        reports = []
+
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+            BarColumn(), TaskProgressColumn(), TimeRemainingColumn(), console=console
+        ) as progress:
+            for username in usernames:
+                task = progress.add_task(f"Scanning @{username}", total=len(sites))
+                results = []
+
+                async def update_progress(result):
+                    progress.advance(task)
+                    results.append(result)
+
+                report = UsernameReport(username=username)
+                raw_results = await checker.check_multiple(sites, username, update_progress)
+                for r in raw_results:
+                    report.add_result(r)
+                report.finish()
+
+                writer.write(report, formats)
+                await self._save_to_db(report)
+                reports.append(report)
+                progress.remove_task(task)
+
+                # Print summary
+                table = Table(title=f"@{username} Results", box=box.ROUNDED)
+                table.add_column("Status", style="bold")
+                table.add_column("Count", justify="right")
+                table.add_row("✅ Claimed", str(report.claimed_count), style="green")
+                table.add_row("❌ Unclaimed", str(report.unclaimed_count), style="red")
+                table.add_row("⚠️ Errors", str(report.error_count), style="yellow")
+                console.print(table)
+
+        return reports
+
+    async def _scan_username(self, username: str, sites: List[str], checker: SiteChecker) -> UsernameReport:
+        report = UsernameReport(username=username)
+        results = await checker.check_multiple(sites, username)
+        for r in results:
+            report.add_result(r)
+        report.finish()
+        return report
+
+    async def _save_to_db(self, report: UsernameReport):
+        for result in report.results:
+            await self.db.save_result(result)
+
+    async def monitor(self, usernames: List[str], interval: int = 3600,
+                      callback: Optional[callable] = None):
+        """Monitor usernames for changes."""
+        self.logger.info(f"Starting monitor for {len(usernames)} usernames, interval: {interval}s")
+        last_results = {}
+
+        async with HTTPClient(self.config, self.rate_limiter) as client:
+            checker = SiteChecker(client, self.registry)
+            notifier = Notifier(self.config.notifications) if self.config.notifications else None
+
+            while True:
+                for username in usernames:
+                    sites = [s.name for s in self.registry.list()]
+                    report = await self._scan_username(username, sites, checker)
+
+                    # Compare with last results
+                    if username in last_results:
+                        await self._detect_changes(username, last_results[username], report, notifier)
+
+                    last_results[username] = {r.site: r.status for r in report.results}
+
+                    if callback:
+                        await callback(report)
+
+                await asyncio.sleep(interval)
+
+    async def _detect_changes(self, username: str, old: Dict, new_report: UsernameReport, notifier: Optional[Notifier]):
+        changes = []
+        for r in new_report.results:
+            old_status = old.get(r.site)
+            if old_status and old_status != r.status.value:
+                changes.append(f"{r.site}: {old_status} → {r.status.value}")
+
+        if changes and notifier:
+            await notifier.notify(f"🔔 Changes detected for @{username}:\n" + "\n".join(changes), new_report)
+
+# ─── CLI ──────────────────────────────────────────────────────────────────
+
+def load_config(path: Optional[Path] = None) -> AppConfig:
+    if path and path.exists():
+        data = yaml.safe_load(path.read_text())
+        return AppConfig(**data)
+    return AppConfig()
+
+def save_config(config: AppConfig, path: Path):
+    data = asdict(config)
+    # Convert ProxyConfig, AuthConfig, NotificationConfig to dict
+    data["proxies"] = [asdict(p) for p in config.proxies]
+    data["auth"] = [asdict(a) for a in config.auth]
+    if config.notifications:
+        data["notifications"] = asdict(config.notifications)
+    path.write_text(yaml.dump(data, default_flow_style=False))
+
+async def main():
+    parser = argparse.ArgumentParser(
+        description="sherlockV2 - Next-Gen Username OSINT Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  sherlockV2 targetuser                          # Basic scan
+  sherlockV2 user1 user2 --full                  # Full scan with all outputs
+  sherlockV2 target --sites github twitter       # Specific sites
+  sherlockV2 target --categories social,code     # By category
+  sherlockV2 target --monitor --interval 3600    # Continuous monitoring
+  sherlockV2 target --config config.yaml         # Custom config
+  sherlockV2 --list-sites                        # List all sites
+  sherlockV2 --list-categories                   # List categories
+        """
+    )
+    parser.add_argument("usernames", nargs="*", help="Usernames to check")
+    parser.add_argument("--sites", "-s", nargs="+", help="Specific sites to check")
+    parser.add_argument("--categories", "-c", nargs="+", help="Categories to check")
+    parser.add_argument("--full", action="store_true", help="Check all sites")
+    parser.add_argument("--formats", "-f", nargs="+", default=["json", "csv", "md"],
+                        choices=["json", "csv", "xlsx", "md", "html", "sqlite"],
+                        help="Output formats")
+    parser.add_argument("--output", "-o", default="./results", help="Output directory")
+    parser.add_argument("--config", help="Config file path")
+    parser.add_argument("--save-config", help="Save default config to file")
+    parser.add_argument("--list-sites", action="store_true", help="List all available sites")
+    parser.add_argument("--list-categories", action="store_true", help="List all categories")
+    parser.add_argument("--monitor", action="store_true", help="Continuous monitoring mode")
+    parser.add_argument("--interval", type=int, default=3600, help="Monitor interval (seconds)")
+    parser.add_argument("--concurrency", type=int, default=50, help="Max concurrent requests")
+    parser.add_argument("--timeout", type=int, default=30, help="Request timeout (seconds)")
+    parser.add_argument("--rate-limit", type=float, default=1.0, help="Default rate limit (req/sec)")
+    parser.add_argument("--proxy", nargs="+", help="Proxy URLs (socks5://, http://)")
+    parser.add_argument("--tor", action="store_true", help="Use Tor (socks5://127.0.0.1:9050)")
+    parser.add_argument("--no-progress", action="store_true", help="Disable progress bar")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
+    parser.add_argument("--version", action="store_true", help="Show version")
+
+    args = parser.parse_args()
+
+    if args.version:
+        print("sherlockV2 v1.0.0")
+        return
+
+    if args.save_config:
+        save_config(AppConfig(), Path(args.save_config))
+        print(f"Config saved to {args.save_config}")
+        return
+
+    config = load_config(Path(args.config) if args.config else None)
+    config.concurrency = args.concurrency
+    config.default_timeout = args.timeout
+    config.default_rate_limit = args.rate_limit
+    config.output_dir = args.output
+
+    if args.proxy:
+        config.proxies = [ProxyConfig(url=p) for p in args.proxy]
+    if args.tor:
+        config.proxies.append(ProxyConfig(url="socks5://127.0.0.1:9050"))
+
+    if args.verbose:
+        config.log_level = "DEBUG"
+
+    engine = SherlockX(config)
+
+    if args.list_sites:
+        for cat in engine.registry.categories():
+            sites = engine.registry.list(category=cat)
+            print(f"\n{cat.upper()} ({len(sites)})")
+            for s in sites:
+                print(f"  {s.name} ({'disabled' if s.disabled else 'enabled'})")
+        return
+
+    if args.list_categories:
+        for cat in engine.registry.categories():
+            count = len(engine.registry.list(category=cat))
+            print(f"  {cat} ({count})")
+        return
+
+    if not args.usernames and not args.monitor:
+        parser.print_help()
+        return
+
+    if args.monitor:
+        if not args.usernames:
+            print("Error: --monitor requires usernames")
+            return
+        await engine.monitor(args.usernames, args.interval)
+        return
+
+    reports = await engine.scan(
+        args.usernames,
+        sites=args.sites if args.sites else None,
+        categories=args.categories if args.categories else None,
+        formats=args.formats,
+        progress=not args.no_progress
+    )
+
+    # Summary
+    total_claimed = sum(r.claimed_count for r in reports)
+    print(f"\n✅ Done. Total claimed: {total_claimed}")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted")
+        sys.exit(1)
