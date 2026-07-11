@@ -1,0 +1,600 @@
+#!/usr/bin/env /home/hany/Osintgram/venv/bin/python3
+"""
+osgr - Instagram OSINT Reconnaissance Tool
+Advanced profile analysis, story tracking, post analytics, and data export
+"""
+
+import sys
+import os
+import json
+import csv
+import argparse
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+from collections import Counter
+import textwrap
+
+import instaloader
+from datetime import timedelta
+
+# ─── Config ──────────────────────────────────────────────────────────────
+SESSION_PATH = '/home/hany/.config/instaloader/session-carte_r8934'
+OUTPUT_DIR = Path('/home/hany/osgr_output')
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ─── Color output ────────────────────────────────────────────────────────
+class C:
+    R = '\033[91m'; G = '\033[92m'; Y = '\033[93m'; B = '\033[94m'
+    M = '\033[95m'; C = '\033[96m'; W = '\033[97m'; D = '\033[90m'
+    BOLD = '\033[1m'; DIM = '\033[2m'; END = '\033[0m'
+
+def c(text, color): return f"{color}{text}{C.END}"
+def bold(text): return f"{C.BOLD}{text}{C.END}"
+def dim(text): return f"{C.DIM}{text}{C.END}"
+
+# ─── Core ────────────────────────────────────────────────────────────────
+class OSGR:
+    def __init__(self, debug=False):
+        self.debug = debug
+        self.L = instaloader.Instaloader(
+            download_videos=False,
+            download_video_thumbnails=False,
+            download_geotags=False,
+            download_comments=False,
+            save_metadata=False,
+            compress_json=False,
+            dirname_pattern=str(OUTPUT_DIR / '{target}'),
+        )
+        self._load_session()
+
+    def _load_session(self):
+        try:
+            self.L.load_session_from_file('carte_r8934', SESSION_PATH)
+        except Exception as e:
+            raise RuntimeError(f"Session load failed: {e}. Login in Chrome first.")
+
+    def get_profile(self, username: str) -> instaloader.Profile:
+        return instaloader.Profile.from_username(self.L.context, username)
+
+    # ─── Data Extractors ────────────────────────────────────────────────
+    def extract_profile(self, p: instaloader.Profile) -> Dict:
+        return {
+            "username": p.username,
+            "full_name": p.full_name,
+            "biography": p.biography,
+            "biography_hashtags": self._extract_hashtags(p.biography or ''),
+            "biography_mentions": self._extract_mentions(p.biography or ''),
+            "external_url": p.external_url,
+            "followers": p.followers,
+            "following": p.followees,
+            "posts_count": p.mediacount,
+            "is_private": p.is_private,
+            "is_verified": p.is_verified,
+            "is_business": p.is_business_account,
+            "business_category": p.business_category_name,
+            "user_id": p.userid,
+            "profile_pic_url": p.profile_pic_url,
+            "profile_pic_hd": p.get_profile_pic_url(),
+            "igtv_count": p.igtvcount,
+            "has_highlight_reels": p.has_highlight_reels,
+            "followed_by_viewer": p.followed_by_viewer,
+            "follows_viewer": p.follows_viewer,
+            "blocked_by_viewer": p.blocked_by_viewer,
+            "restricted_by_viewer": getattr(p, 'has_restricted_viewer', False),
+        }
+
+    def _extract_hashtags(self, text: str) -> List[str]:
+        return re.findall(r'#(\w+)', text)
+
+    def _extract_mentions(self, text: str) -> List[str]:
+        return re.findall(r'@(\w+)', text)
+
+    def extract_posts(self, p: instaloader.Profile, limit: int = 30) -> List[Dict]:
+        posts = []
+        try:
+            for i, post in enumerate(p.get_posts()):
+                if i >= limit:
+                    break
+                posts.append({
+                    "shortcode": post.shortcode,
+                    "url": f"https://instagram.com/p/{post.shortcode}/",
+                    "date_utc": post.date_utc.isoformat(),
+                    "timestamp": int(post.date_utc.timestamp()),
+                    "is_video": post.is_video,
+                    "video_duration": post.video_duration,
+                    "video_view_count": post.video_view_count,
+                    "likes": post.likes,
+                    "comments": post.comments,
+                    "caption": post.caption,
+                    "caption_hashtags": post.caption_hashtags,
+                    "caption_mentions": post.caption_mentions,
+                    "location": post.location.name if post.location else None,
+                    "location_id": post.location.id if post.location else None,
+                    "tagged_users": [u.username for u in post.tagged_users] if post.tagged_users else [],
+                    "is_sponsored": post.is_sponsored,
+                    "accessibility_caption": post.accessibility_caption,
+                })
+        except Exception as e:
+            print(dim(f"  Post extraction error: {e}"))
+        return posts
+
+    def extract_highlights(self, p: instaloader.Profile) -> List[Dict]:
+        highlights = []
+        try:
+            for h in self.L.get_highlights(p):
+                items = []
+                for item in h.get_items():
+                    items.append({
+                        "date_utc": item.date_utc.isoformat(),
+                        "type": "Video" if item.is_video else "Image",
+                        "url": item.video_url if item.is_video else item.url,
+                    })
+                highlights.append({
+                    "title": h.title,
+                    "cover_url": h.cover_url,
+                    "item_count": len(items),
+                    "items": items,
+                })
+        except Exception as e:
+            print(dim(f"  Highlights error: {e}"))
+        return highlights
+
+    def extract_stories(self, p: instaloader.Profile) -> List[Dict]:
+        stories = []
+        try:
+            for story in self.L.get_stories(userids=[p.userid]):
+                for item in story.get_items():
+                    stories.append({
+                        "date_utc": item.date_utc.isoformat(),
+                        "type": "Video" if item.is_video else "Image",
+                        "url": item.video_url if item.is_video else item.url,
+                        "expires": (item.date_utc + timedelta(hours=24)).isoformat(),
+                    })
+        except Exception as e:
+            print(dim(f"  Stories error: {e}"))
+        return stories
+
+    def extract_followers_sample(self, p: instaloader.Profile, limit: int = 100) -> List[Dict]:
+        followers = []
+        try:
+            for f in p.get_followers():
+                if len(followers) >= limit:
+                    break
+                followers.append({
+                    "username": f.username,
+                    "full_name": f.full_name,
+                    "is_private": f.is_private,
+                    "is_verified": f.is_verified,
+                    "followers": f.followers,
+                    "posts": f.mediacount,
+                })
+        except Exception:
+            pass
+        return followers
+
+    def extract_following_sample(self, p: instaloader.Profile, limit: int = 100) -> List[Dict]:
+        following = []
+        try:
+            for f in p.get_followees():
+                if len(following) >= limit:
+                    break
+                following.append({
+                    "username": f.username,
+                    "full_name": f.full_name,
+                    "is_private": f.is_private,
+                    "is_verified": f.is_verified,
+                    "followers": f.followers,
+                    "posts": f.mediacount,
+                })
+        except Exception:
+            pass
+        return following
+
+    def extract_comments(self, p: instaloader.Profile, post_limit: int = 5, comment_limit: int = 20) -> List[Dict]:
+        comments = []
+        try:
+            for i, post in enumerate(p.get_posts()):
+                if i >= post_limit:
+                    break
+                try:
+                    for c in post.get_comments():
+                        if len(comments) >= comment_limit:
+                            break
+                        comments.append({
+                            "post_shortcode": post.shortcode,
+                            "commenter": c.owner.username,
+                            "commenter_verified": c.owner.is_verified,
+                            "text": c.text,
+                            "date_utc": c.created_at_utc.isoformat(),
+                            "likes": c.likes_count,
+                        })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return comments
+
+    # ─── Analytics ──────────────────────────────────────────────────────
+    def analyze_posts(self, posts: List[Dict]) -> Dict:
+        if not posts:
+            return {}
+        total = len(posts)
+        videos = sum(1 for p in posts if p['is_video'])
+        images = total - videos
+        total_likes = sum(p['likes'] for p in posts)
+        total_comments = sum(p['comments'] for p in posts)
+        avg_likes = total_likes / total if total else 0
+        avg_comments = total_comments / total if total else 0
+
+        all_tags = []
+        for p in posts:
+            all_tags.extend(p.get('caption_hashtags', []))
+        top_tags = Counter(all_tags).most_common(15)
+
+        hours = []
+        for p in posts:
+            try:
+                dt = datetime.fromisoformat(p['date_utc'].replace('Z', '+00:00'))
+                hours.append(dt.hour)
+            except Exception:
+                pass
+        top_hours = Counter(hours).most_common(5)
+
+        return {
+            "total_analyzed": total,
+            "images": images,
+            "videos": videos,
+            "total_likes": total_likes,
+            "total_comments": total_comments,
+            "avg_likes_per_post": round(avg_likes, 1),
+            "avg_comments_per_post": round(avg_comments, 1),
+            "top_hashtags": top_tags,
+            "top_posting_hours": top_hours,
+            "video_ratio": round(videos / total * 100, 1) if total else 0,
+        }
+
+    def analyze_followers(self, followers: List[Dict]) -> Dict:
+        if not followers:
+            return {}
+        total = len(followers)
+        verified = sum(1 for f in followers if f['is_verified'])
+        private = sum(1 for f in followers if f['is_private'])
+        avg_followers = sum(f['followers'] for f in followers) / total
+        avg_posts = sum(f['posts'] for f in followers) / total
+        top_influential = sorted(followers, key=lambda x: x['followers'], reverse=True)[:5]
+        return {
+            "sample_size": total,
+            "verified_count": verified,
+            "private_count": private,
+            "verified_pct": round(verified / total * 100, 1),
+            "private_pct": round(private / total * 100, 1),
+            "avg_followers": round(avg_followers, 1),
+            "avg_posts": round(avg_posts, 1),
+            "top_influential": top_influential,
+        }
+
+    # ─── Exporters ──────────────────────────────────────────────────────
+    def save_json(self, data: Dict, username: str) -> Path:
+        filepath = OUTPUT_DIR / f"{username}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=2, default=str, ensure_ascii=False)
+        return filepath
+
+    def save_csv(self, data: Dict, username: str) -> List[Path]:
+        paths = []
+        if data.get('posts'):
+            filepath = OUTPUT_DIR / f"{username}_posts.csv"
+            with open(filepath, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=data['posts'][0].keys())
+                writer.writeheader()
+                writer.writerows(data['posts'])
+            paths.append(filepath)
+
+        if data.get('highlights'):
+            filepath = OUTPUT_DIR / f"{username}_highlights.csv"
+            flat = []
+            for h in data['highlights']:
+                for item in h['items']:
+                    flat.append({
+                        'highlight_title': h['title'],
+                        'item_date': item['date_utc'],
+                        'item_type': item['type'],
+                        'item_url': item['url'],
+                    })
+            with open(filepath, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=flat[0].keys())
+                writer.writeheader()
+                writer.writerows(flat)
+            paths.append(filepath)
+
+        return paths
+
+    def save_report(self, data: Dict, username: str) -> Path:
+        filepath = OUTPUT_DIR / f"{username}_report.md"
+        p = data['profile']
+        a = data.get('analysis', {})
+        fa = data.get('followers_analysis', {})
+
+        lines = [
+            f"# Instagram OSINT Report: @{username}",
+            f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
+            "",
+            "## Profile",
+            f"- **Username:** @{p['username']}",
+            f"- **Name:** {p['full_name'] or 'N/A'}",
+            f"- **Bio:** {p['biography'] or 'N/A'}",
+            f"- **Followers:** {p['followers']:,}",
+            f"- **Following:** {p['following']:,}",
+            f"- **Posts:** {p['posts_count']:,}",
+            f"- **Private:** {'Yes' if p['is_private'] else 'No'}",
+            f"- **Verified:** {'Yes' if p['is_verified'] else 'No'}",
+            f"- **Business:** {'Yes' if p['is_business'] else 'No'}",
+            f"- **User ID:** {p['user_id']}",
+            f"- **Profile Pic:** {p['profile_pic_hd']}",
+        ]
+
+        if p['external_url']:
+            lines.append(f"- **Website:** {p['external_url']}")
+        if p['business_category']:
+            lines.append(f"- **Category:** {p['business_category']}")
+
+        lines.append("\n## Bio Analysis")
+        if p['biography_hashtags']:
+            lines.append(f"- **Hashtags:** {', '.join('#'+h for h in p['biography_hashtags'])}")
+        if p['biography_mentions']:
+            lines.append(f"- **Mentions:** {', '.join('@'+m for m in p['biography_mentions'])}")
+
+        if a:
+            lines.extend([
+                "\n## Post Analytics (last {} posts)".format(a['total_analyzed']),
+                f"- **Images:** {a['images']} | **Videos:** {a['videos']} ({a['video_ratio']}%)",
+                f"- **Total Likes:** {a['total_likes']:,} | **Total Comments:** {a['total_comments']:,}",
+                f"- **Avg Likes/Post:** {a['avg_likes_per_post']:,} | **Avg Comments/Post:** {a['avg_comments_per_post']:,}",
+                f"- **Top Hashtags:** {', '.join(f'#{t[0]} ({t[1]})' for t in a['top_hashtags'][:5]) or 'None'}",
+                f"- **Peak Hours (UTC):** {', '.join(f'{h[0]}:00 ({h[1]})' for h in a['top_posting_hours']) or 'N/A'}",
+            ])
+            if a.get('most_liked'):
+                lines.append(f"- **Most Liked:** https://instagram.com/p/{a['most_liked']}/")
+            if a.get('most_commented'):
+                lines.append(f"- **Most Commented:** https://instagram.com/p/{a['most_commented']}/")
+
+        if data.get('highlights'):
+            lines.append("\n## Story Highlights")
+            for h in data['highlights']:
+                lines.append(f"- **{h['title']}** ({h['item_count']} items)")
+
+        if data.get('stories'):
+            lines.append("\n## Active Stories (24h)")
+            for s in data['stories']:
+                lines.append(f"- {s['date_utc']} - {s['type']}")
+
+        if fa:
+            lines.extend([
+                "\n## Follower Sample Analysis",
+                f"- **Sample Size:** {fa['sample_size']}",
+                f"- **Verified:** {fa['verified_count']} ({fa['verified_pct']}%)",
+                f"- **Private:** {fa['private_count']} ({fa['private_pct']}%)",
+                f"- **Avg Followers:** {fa['avg_followers']:,}",
+                f"- **Avg Posts:** {fa['avg_posts']:.1f}",
+            ])
+            if fa['top_influential']:
+                top = ', '.join(f"@{f['username']} ({f['followers']:,})" for f in fa['top_influential'][:3])
+                lines.append(f"- **Top Influential:** {top}")
+
+        with open(filepath, 'w') as f:
+            f.write('\n'.join(lines))
+        return filepath
+
+
+# ─── CLI ────────────────────────────────────────────────────────────────
+def print_banner():
+    print(c("""
+╔══════════════════════════════════════════════════════════════╗
+║  OSGR - Instagram OSINT Reconnaissance Tool                ║
+║  Profile Analysis • Story Tracking • Post Analytics        ║
+╚══════════════════════════════════════════════════════════════╝
+""", C.C))
+
+def format_output(data: Dict, verbose: bool = False):
+    p = data['profile']
+    a = data.get('analysis', {})
+    fa = data.get('followers_analysis', {})
+
+    # Header
+    print(f"\n{bold('='*60)}")
+    print(f"  {bold('@' + p['username'])}  |  {p['full_name'] or 'N/A'}")
+    print(f"{bold('='*60)}")
+
+    # Basic info
+    info = [
+        ("Name", p['full_name'] or 'N/A'),
+        ("Bio", (p['biography'][:80] + '...') if p['biography'] and len(p['biography']) > 80 else p['biography'] or 'N/A'),
+        ("Followers", f"{p['followers']:,}"),
+        ("Following", f"{p['following']:,}"),
+        ("Posts", f"{p['posts_count']:,}"),
+        ("Private", "Yes" if p['is_private'] else "No"),
+        ("Verified", "Yes" if p['is_verified'] else "No"),
+        ("Business", "Yes" if p['is_business'] else "No"),
+    ]
+    if p['external_url']:
+        info.append(("Website", p['external_url']))
+
+    for k, v in info:
+        print(f"  {c(k+':', C.C):<14} {v}")
+
+    if p['biography_hashtags']:
+        print(f"  {c('Bio Tags:', C.C):<14} {' '.join(c('#'+h, C.Y) for h in p['biography_hashtags'])}")
+    if p['biography_mentions']:
+        print(f"  {c('Bio Mentions:', C.C):<14} {' '.join(c('@'+m, C.M) for m in p['biography_mentions'])}")
+
+    # Analytics
+    if a:
+        print(c("\n  📊 Post Analytics (last {} posts)".format(a['total_analyzed']), C.BOLD))
+        print(f"    Images: {a['images']}  Videos: {a['videos']} ({a['video_ratio']}%)")
+        print(f"    Total Likes: {a['total_likes']:,}  Total Comments: {a['total_comments']:,}")
+        print(f"    Avg Likes: {a['avg_likes_per_post']:,}  Avg Comments: {a['avg_comments_per_post']:,}")
+        if a['top_hashtags']:
+            print(f"    Top Hashtags: {', '.join(c('#'+t, C.Y)+f'({c})' for t,c in a['top_hashtags'][:5])}")
+        if a['top_posting_hours']:
+            print(f"    Peak Hours (UTC): {', '.join(f'{h}:00({c})' for h,c in a['top_posting_hours'])}")
+
+    # Highlights
+    if data.get('highlights'):
+        print(c("\n  📌 Story Highlights", C.BOLD))
+        for h in data['highlights']:
+            print(f"    • {h['title']} ({h['item_count']} items)")
+
+    # Stories
+    if data.get('stories'):
+        print(c("\n  📸 Active Stories (24h)", C.BOLD))
+        for s in data['stories'][:5]:
+            print(f"    • {s['date_utc']} - {s['type']}")
+
+    # Followers analysis
+    if fa:
+        print(c("\n  👥 Followers Sample", C.BOLD))
+        print(f"    Sample: {fa['sample_size']} | Private: {fa['private_pct']}% | Verified: {fa['verified_pct']}%")
+        print(f"    Avg Followers: {fa['avg_followers']:,} | Avg Posts: {fa['avg_posts']:.1f}")
+        if fa['top_influential']:
+            top = ', '.join(f"@{f['username']} ({f['followers']:,})" for f in fa['top_influential'][:3])
+            print(f"    Top: {top}")
+
+    # Verbose: recent posts
+    if verbose and data.get('posts'):
+        print(c("\n  📝 Recent Posts", C.BOLD))
+        for post in data['posts'][:5]:
+            media = "🎥" if post['is_video'] else "🖼️"
+            date = datetime.fromisoformat(post['date_utc']).strftime('%Y-%m-%d %H:%M')
+            cap = (post['caption'][:60] + '...') if post['caption'] and len(post['caption']) > 60 else post['caption'] or ''
+            print(f"    {media} {date} | ❤️{post['likes']:,} 💬{post['comments']:,} | {cap}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='osgr - Instagram OSINT Reconnaissance Tool',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent('''
+        Examples:
+          osgr nasa                    # Basic profile info
+          osgr nasa --stories          # Include active stories
+          osgr nasa --analytics        # Post analytics (30 posts)
+          osgr nasa --full             # Everything (posts, highlights, stories, followers, following, comments)
+          osgr nasa --followers 100    # Get 100 followers sample
+          osgr nasa --following 50     # Get 50 following sample
+          osgr nasa --comments 10      # Get comments from last 10 posts
+          osgr nasa --save             # Save JSON + CSV + Markdown report
+          osgr nasa --csv              # Save CSV exports
+          osgr nasa --json             # Output raw JSON to stdout
+          osgr nasa --verbose -v       # Verbose output with recent posts
+        ''')
+    )
+    parser.add_argument('username', help='Target username (with or without @)')
+    parser.add_argument('--stories', action='store_true', help='Fetch active 24h stories')
+    parser.add_argument('--analytics', action='store_true', help='Analyze posts (default: 30)')
+    parser.add_argument('--posts', type=int, default=30, help='Number of posts to analyze (default: 30)')
+    parser.add_argument('--followers', type=int, metavar='N', help='Fetch N followers sample')
+    parser.add_argument('--following', type=int, metavar='N', help='Fetch N following sample')
+    parser.add_argument('--comments', type=int, metavar='N', help='Fetch comments from last N posts')
+    parser.add_argument('--full', action='store_true', help='Full analysis (posts+stories+highlights+followers+following+comments)')
+    parser.add_argument('--save', action='store_true', help='Save JSON + CSV + Markdown report')
+    parser.add_argument('--csv', action='store_true', help='Save CSV exports')
+    parser.add_argument('--json', action='store_true', help='Output raw JSON to stdout')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
+    parser.add_argument('--debug', action='store_true', help='Debug mode')
+
+    args = parser.parse_args()
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
+
+    target = args.username.lstrip('@')
+    post_limit = 100 if args.full else args.posts
+
+    print_banner()
+    print(f"  Target: {c('@'+target, C.G)} | Session: {c('loaded', C.G)}")
+
+    osgr = OSGR(debug=args.debug)
+
+    try:
+        print(f"  Fetching profile...", end=' ', flush=True)
+        profile = osgr.get_profile(target)
+        print(c("OK", C.G))
+
+        data = {'profile': osgr.extract_profile(profile)}
+
+        print(f"  Fetching highlights...", end=' ', flush=True)
+        data['highlights'] = osgr.extract_highlights(profile)
+        print(c("OK", C.G))
+
+        if args.analytics or args.full or args.posts != 30:
+            print(f"  Analyzing {post_limit} posts...", end=' ', flush=True)
+            posts = osgr.extract_posts(profile, post_limit)
+            data['posts'] = posts
+            data['analysis'] = osgr.analyze_posts(posts)
+            print(c("OK", C.G))
+
+        if args.full or args.stories:
+            print(f"  Fetching stories...", end=' ', flush=True)
+            data['stories'] = osgr.extract_stories(profile)
+            print(c("OK", C.G))
+
+        if args.full or args.followers:
+            flimit = 200 if args.full else args.followers
+            print(f"  Fetching {flimit} followers...", end=' ', flush=True)
+            followers = osgr.extract_followers_sample(profile, flimit)
+            data['followers_sample'] = followers
+            data['followers_analysis'] = osgr.analyze_followers(followers)
+            print(c("OK", C.G))
+
+        if args.full or args.following:
+            flimit = 200 if args.full else args.following
+            print(f"  Fetching {flimit} following...", end=' ', flush=True)
+            data['following_sample'] = osgr.extract_following_sample(profile, flimit)
+            print(c("OK", C.G))
+
+        if args.full or args.comments:
+            climit = 10 if args.full else args.comments
+            print(f"  Fetching comments from {climit} posts...", end=' ', flush=True)
+            data['comments'] = osgr.extract_comments(profile, climit)
+            print(c("OK", C.G))
+
+        # Output
+        if args.json:
+            print(json.dumps(data, indent=2, default=str))
+        else:
+            format_output(data, args.verbose)
+
+        # Save
+        if args.save or args.csv or args.full:
+            print(c("\n  Saving files...", C.Y))
+            if args.save or args.full:
+                json_path = osgr.save_json(data, target)
+                print(f"    JSON:  {json_path}")
+                csv_paths = osgr.save_csv(data, target)
+                for cp in csv_paths:
+                    print(f"    CSV:   {cp}")
+                md_path = osgr.save_report(data, target)
+                print(f"    MD:    {md_path}")
+            elif args.csv:
+                csv_paths = osgr.save_csv(data, target)
+                for cp in csv_paths:
+                    print(f"    CSV:   {cp}")
+
+    except instaloader.exceptions.ProfileNotExistsException:
+        print(c(f"\n  Profile '@{target}' does not exist", C.R))
+        sys.exit(1)
+    except instaloader.exceptions.LoginRequiredException:
+        print(c("\n  Login required. Open Chrome → instagram.com → login as carte_r8934", C.R))
+        sys.exit(1)
+    except Exception as e:
+        print(c(f"\n  Error: {e}", C.R))
+        if args.debug or args.verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
