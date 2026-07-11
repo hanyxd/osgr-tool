@@ -1,0 +1,5 @@
+# OSGR tool repo - ignore home directory files
+*
+!/osgr_tool/
+!/osgr_tool/**
+!/.gitignore
