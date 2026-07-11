@@ -120,6 +120,47 @@ class OSGR:
             print(dim(f"  Post extraction error: {e}"))
         return posts
 
+    def extract_post_likes(self, p: instaloader.Profile, limit: int = 5, max_likers_per_post: int = 50) -> List[Dict]:
+        """Extract likers for recent posts. Requires following the target account."""
+        likes_data = []
+        try:
+            if not p.followed_by_viewer:
+                print(c("  ⚠️  WARNING: Not following target - Instagram blocks like data", C.Y))
+                return []
+
+            for i, post in enumerate(p.get_posts()):
+                if i >= limit:
+                    break
+                try:
+                    likers = []
+                    for liker in post.get_likes():
+                        if len(likers) >= max_likers_per_post:
+                            break
+                        likers.append({
+                            "username": liker.username,
+                            "full_name": liker.full_name,
+                            "is_verified": liker.is_verified,
+                            "is_private": liker.is_private,
+                            "followers": liker.followers,
+                        })
+                    likes_data.append({
+                        "post_shortcode": post.shortcode,
+                        "post_url": f"https://instagram.com/p/{post.shortcode}/",
+                        "post_date": post.date_utc.isoformat(),
+                        "total_likes": post.likes,
+                        "likers_fetched": len(likers),
+                        "likers": likers,
+                    })
+                except Exception as e:
+                    print(dim(f"    Likes error for {post.shortcode}: {e}"))
+                    likes_data.append({
+                        "post_shortcode": post.shortcode,
+                        "error": str(e),
+                    })
+        except Exception as e:
+            print(dim(f"  Likes extraction error: {e}"))
+        return likes_data
+
     def extract_highlights(self, p: instaloader.Profile) -> List[Dict]:
         highlights = []
         try:
@@ -309,6 +350,27 @@ class OSGR:
                 writer.writerows(flat)
             paths.append(filepath)
 
+        if data.get('likes'):
+            filepath = OUTPUT_DIR / f"{username}_likes.csv"
+            flat = []
+            for l in data['likes']:
+                for liker in l.get('likers', []):
+                    flat.append({
+                        'post_shortcode': l['post_shortcode'],
+                        'post_date': l.get('post_date', ''),
+                        'liker_username': liker['username'],
+                        'liker_full_name': liker['full_name'],
+                        'liker_verified': liker['is_verified'],
+                        'liker_private': liker['is_private'],
+                        'liker_followers': liker['followers'],
+                    })
+            if flat:
+                with open(filepath, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=flat[0].keys())
+                    writer.writeheader()
+                    writer.writerows(flat)
+                paths.append(filepath)
+
         return paths
 
     def save_report(self, data: Dict, username: str) -> Path:
@@ -348,17 +410,14 @@ class OSGR:
 
         if a:
             lines.extend([
-                "\n## Post Analytics (last {} posts)".format(a['total_analyzed']),
+                "",
+                f"## Post Analytics (last {a['total_analyzed']} posts)",
                 f"- **Images:** {a['images']} | **Videos:** {a['videos']} ({a['video_ratio']}%)",
                 f"- **Total Likes:** {a['total_likes']:,} | **Total Comments:** {a['total_comments']:,}",
                 f"- **Avg Likes/Post:** {a['avg_likes_per_post']:,} | **Avg Comments/Post:** {a['avg_comments_per_post']:,}",
                 f"- **Top Hashtags:** {', '.join(f'#{t[0]} ({t[1]})' for t in a['top_hashtags'][:5]) or 'None'}",
                 f"- **Peak Hours (UTC):** {', '.join(f'{h[0]}:00 ({h[1]})' for h in a['top_posting_hours']) or 'N/A'}",
             ])
-            if a.get('most_liked'):
-                lines.append(f"- **Most Liked:** https://instagram.com/p/{a['most_liked']}/")
-            if a.get('most_commented'):
-                lines.append(f"- **Most Commented:** https://instagram.com/p/{a['most_commented']}/")
 
         if data.get('highlights'):
             lines.append("\n## Story Highlights")
@@ -370,9 +429,20 @@ class OSGR:
             for s in data['stories']:
                 lines.append(f"- {s['date_utc']} - {s['type']}")
 
+        if data.get('likes'):
+            lines.append("\n## Post Likes (requires following target)")
+            for l in data['likes']:
+                if 'error' in l:
+                    lines.append(f"- {l['post_shortcode']}: ERROR - {l['error']}")
+                else:
+                    lines.append(f"- {l['post_shortcode']} ({l.get('total_likes', 0)} likes): {l['likers_fetched']} likers fetched")
+                    for liker in l.get('likers', [])[:3]:
+                        lines.append(f"  - @{liker['username']} ({liker['followers']:,} followers)")
+
         if fa:
             lines.extend([
-                "\n## Follower Sample Analysis",
+                "",
+                f"## Follower Sample Analysis",
                 f"- **Sample Size:** {fa['sample_size']}",
                 f"- **Verified:** {fa['verified_count']} ({fa['verified_pct']}%)",
                 f"- **Private:** {fa['private_count']} ({fa['private_pct']}%)",
@@ -402,12 +472,10 @@ def format_output(data: Dict, verbose: bool = False):
     a = data.get('analysis', {})
     fa = data.get('followers_analysis', {})
 
-    # Header
     print(f"\n{bold('='*60)}")
     print(f"  {bold('@' + p['username'])}  |  {p['full_name'] or 'N/A'}")
     print(f"{bold('='*60)}")
 
-    # Basic info
     info = [
         ("Name", p['full_name'] or 'N/A'),
         ("Bio", (p['biography'][:80] + '...') if p['biography'] and len(p['biography']) > 80 else p['biography'] or 'N/A'),
@@ -429,7 +497,6 @@ def format_output(data: Dict, verbose: bool = False):
     if p['biography_mentions']:
         print(f"  {c('Bio Mentions:', C.C):<14} {' '.join(c('@'+m, C.M) for m in p['biography_mentions'])}")
 
-    # Analytics
     if a:
         print(c("\n  📊 Post Analytics (last {} posts)".format(a['total_analyzed']), C.BOLD))
         print(f"    Images: {a['images']}  Videos: {a['videos']} ({a['video_ratio']}%)")
@@ -440,19 +507,26 @@ def format_output(data: Dict, verbose: bool = False):
         if a['top_posting_hours']:
             print(f"    Peak Hours (UTC): {', '.join(f'{h}:00({c})' for h,c in a['top_posting_hours'])}")
 
-    # Highlights
     if data.get('highlights'):
         print(c("\n  📌 Story Highlights", C.BOLD))
         for h in data['highlights']:
             print(f"    • {h['title']} ({h['item_count']} items)")
 
-    # Stories
     if data.get('stories'):
         print(c("\n  📸 Active Stories (24h)", C.BOLD))
         for s in data['stories'][:5]:
             print(f"    • {s['date_utc']} - {s['type']}")
 
-    # Followers analysis
+    if data.get('likes'):
+        print(c("\n  ❤️  Post Likes", C.BOLD))
+        for l in data['likes']:
+            if 'error' in l:
+                print(f"    {l['post_shortcode']}: {c('BLOCKED', C.R)} - {l['error']}")
+            else:
+                print(f"    {l['post_shortcode']} ({l.get('total_likes', 0)} likes): {l['likers_fetched']} likers")
+                for liker in l.get('likers', [])[:3]:
+                    print(f"      @{liker['username']} ({liker['followers']:,} followers)")
+
     if fa:
         print(c("\n  👥 Followers Sample", C.BOLD))
         print(f"    Sample: {fa['sample_size']} | Private: {fa['private_pct']}% | Verified: {fa['verified_pct']}%")
@@ -461,7 +535,6 @@ def format_output(data: Dict, verbose: bool = False):
             top = ', '.join(f"@{f['username']} ({f['followers']:,})" for f in fa['top_influential'][:3])
             print(f"    Top: {top}")
 
-    # Verbose: recent posts
     if verbose and data.get('posts'):
         print(c("\n  📝 Recent Posts", C.BOLD))
         for post in data['posts'][:5]:
@@ -479,7 +552,8 @@ def main():
           osgr nasa                    # Basic profile info
           osgr nasa --stories          # Include active stories
           osgr nasa --analytics        # Post analytics (30 posts)
-          osgr nasa --full             # Everything (posts, highlights, stories, followers, following, comments)
+          osgr nasa --likes 5          # Get likers for last 5 posts (requires following target)
+          osgr nasa --full             # Everything (posts, highlights, stories, followers, following, comments, likes)
           osgr nasa --followers 100    # Get 100 followers sample
           osgr nasa --following 50     # Get 50 following sample
           osgr nasa --comments 10      # Get comments from last 10 posts
@@ -496,7 +570,8 @@ def main():
     parser.add_argument('--followers', type=int, metavar='N', help='Fetch N followers sample')
     parser.add_argument('--following', type=int, metavar='N', help='Fetch N following sample')
     parser.add_argument('--comments', type=int, metavar='N', help='Fetch comments from last N posts')
-    parser.add_argument('--full', action='store_true', help='Full analysis (posts+stories+highlights+followers+following+comments)')
+    parser.add_argument('--likes', type=int, metavar='N', help='Get likers for last N posts (requires following target)')
+    parser.add_argument('--full', action='store_true', help='Full analysis (posts+stories+highlights+followers+following+comments+likes)')
     parser.add_argument('--save', action='store_true', help='Save JSON + CSV + Markdown report')
     parser.add_argument('--csv', action='store_true', help='Save CSV exports')
     parser.add_argument('--json', action='store_true', help='Output raw JSON to stdout')
@@ -511,6 +586,7 @@ def main():
 
     target = args.username.lstrip('@')
     post_limit = 100 if args.full else args.posts
+    likes_limit = 10 if args.full else (args.likes if args.likes else 0)
 
     print_banner()
     print(f"  Target: {c('@'+target, C.G)} | Session: {c('loaded', C.G)}")
@@ -558,6 +634,11 @@ def main():
             climit = 10 if args.full else args.comments
             print(f"  Fetching comments from {climit} posts...", end=' ', flush=True)
             data['comments'] = osgr.extract_comments(profile, climit)
+            print(c("OK", C.G))
+
+        if args.full or args.likes:
+            print(f"  Fetching likes for {likes_limit} posts...", end=' ', flush=True)
+            data['likes'] = osgr.extract_post_likes(profile, likes_limit)
             print(c("OK", C.G))
 
         # Output
