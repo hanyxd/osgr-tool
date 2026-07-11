@@ -1,5 +1,12 @@
 # osgr - Instagram OSINT Reconnaissance Tool
 
+![GitHub stars](https://img.shields.io/github/stars/hanyxd/osgr-tool?style=social)
+![GitHub forks](https://img.shields.io/github/forks/hanyxd/osgr-tool?style=social)
+![GitHub issues](https://img.shields.io/github/issues/hanyxd/osgr-tool)
+![GitHub license](https://img.shields.io/github/license/hanyxd/osgr-tool)
+![Python](https://img.shields.io/badge/python-3.8+-blue)
+![Platform](https://img.shields.io/badge/platform-linux%20%7C%20windows%20%7C%20macos-lightgrey)
+
 Advanced Instagram profile analysis, story tracking, post analytics, and data export for OSINT investigations.
 
 ## ⚡ Quick Start (30 seconds)
