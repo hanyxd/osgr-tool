@@ -2,6 +2,29 @@
 
 Advanced Instagram profile analysis, story tracking, post analytics, and data export for OSINT investigations.
 
+## ⚡ Quick Start (30 seconds)
+
+```bash
+# 1. Install dependencies
+pip install instaloader browser-cookie3
+
+# 2. Clone & install
+git clone https://github.com/hanyxd/osgr-tool
+cd osgr-tool
+chmod +x osgr
+sudo ln -s $(pwd)/osgr /usr/local/bin/osgr
+
+# 3. Login to Instagram in Chrome (use burner account!)
+#    Open Chrome → instagram.com → login
+
+# 4. Run your first scan
+osgr nasa --analytics --stories --save
+```
+
+That's it! Results saved to `~/osgr_output/`
+
+---
+
 ## Features
 
 - **Profile Intelligence** — Username, bio, followers/following, verification, business category, profile pictures
