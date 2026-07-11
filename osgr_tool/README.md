@@ -25,111 +25,286 @@ That's it! Results saved to `~/osgr_output/`
 
 ---
 
-## Features
+## 📦 Cross-Platform Installation
 
-- **Profile Intelligence** — Username, bio, followers/following, verification, business category, profile pictures
-- **Post Analytics** — Likes, comments, hashtags, mentions, locations, engagement rates, posting patterns
-- **Story Tracking** — Active 24h stories + saved highlights with full metadata
-- **Likes Analysis** — Who liked specific posts (requires following target account)
-- **Follower/Following Sampling** — Export follower/following lists with metadata
-- **Comments Extraction** — Recent comments from posts
-- **Multiple Export Formats** — JSON, CSV, Markdown reports
+### Linux (All Distributions)
 
-## Installation
-
+#### Debian/Ubuntu/Mint/Pop!_OS/Kali/Parrot
 ```bash
-# Requires Python 3.8+ and instaloader
-pip install instaloader browser-cookie3
+# System packages
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv git chromium-browser
 
-# Clone and install
+# Python dependencies
+pip3 install instaloader browser-cookie3
+
+# Clone & install
 git clone https://github.com/hanyxd/osgr-tool
 cd osgr-tool
 chmod +x osgr
 sudo ln -s $(pwd)/osgr /usr/local/bin/osgr
 ```
 
-## Authentication
-
-Login to Instagram in **Chrome** as your investigation account (burner recommended), then osgr will automatically use those cookies:
-
+#### Fedora/RHEL/CentOS/AlmaLinux/Rocky
 ```bash
-# 1. Open Chrome → instagram.com → login
-# 2. Run osgr (it auto-detects Chrome session)
-osgr target_username
+sudo dnf install -y python3 python3-pip python3-virtualenv git chromium
+pip3 install instaloader browser-cookie3
+git clone https://github.com/hanyxd/osgr-tool
+cd osgr-tool
+chmod +x osgr
+sudo ln -s $(pwd)/osgr /usr/local/bin/osgr
 ```
 
-## Usage
-
+#### Arch/Manjaro/EndeavourOS/Garuda
 ```bash
-osgr <username> [options]
+sudo pacman -S python python-pip git chromium
+pip install instaloader browser-cookie3
+git clone https://github.com/hanyxd/osgr-tool
+cd osgr-tool
+chmod +x osgr
+sudo ln -s $(pwd)/osgr /usr/local/bin/osgr
 ```
 
-| Option | Description |
-|--------|-------------|
-| `--stories` | Fetch active 24h stories |
-| `--analytics` | Analyze last 30 posts (engagement, hashtags, timing) |
-| `--posts N` | Number of posts to analyze (default: 30) |
-| `--followers N` | Fetch N followers sample |
-| `--following N` | Fetch N following sample |
-| `--comments N` | Fetch comments from last N posts |
-| `--likes N` | Get likers for last N posts (requires following target) |
-| `--full` | Everything (posts + stories + highlights + followers + following + comments + likes) |
-| `--save` | Save JSON + CSV + Markdown report |
-| `--csv` | Save CSV exports only |
-| `--json` | Output raw JSON to stdout |
-| `--verbose, -v` | Verbose output with recent posts |
-| `--debug` | Debug mode |
+#### openSUSE (Tumbleweed/Leap)
+```bash
+sudo zypper install python3 python3-pip git chromium
+pip3 install instaloader browser-cookie3
+git clone https://github.com/hanyxd/osgr-tool
+cd osgr-tool
+chmod +x osgr
+sudo ln -s $(pwd)/osgr /usr/local/bin/osgr
+```
 
-## Examples
+#### Alpine Linux
+```bash
+apk add python3 py3-pip git chromium
+pip3 install instaloader browser-cookie3
+git clone https://github.com/hanyxd/osgr-tool
+cd osgr-tool
+chmod +x osgr
+sudo ln -s $(pwd)/osgr /usr/local/bin/osgr
+```
+
+#### NixOS
+```bash
+# Add to configuration.nix or use nix-shell
+nix-shell -p python3 python3Packages.instaloader python3Packages.browser-cookie3 chromium git
+# Or permanent:
+# environment.systemPackages = with pkgs; [ python3 python3Packages.instaloader python3Packages.browser-cookie3 chromium git ];
+git clone https://github.com/hanyxd/osgr-tool
+cd osgr-tool
+chmod +x osgr
+sudo ln -s $(pwd)/osgr /usr/local/bin/osgr
+```
+
+#### Using Virtual Environment (Recommended for All Distros)
+```bash
+git clone https://github.com/hanyxd/osgr-tool
+cd osgr-tool
+python3 -m venv venv
+source venv/bin/activate
+pip install instaloader browser-cookie3
+# Run with venv python
+./osgr nasa --analytics --stories --save
+```
+
+---
+
+### Windows (10/11)
+
+#### Option A: Native Windows (PowerShell)
+
+**Prerequisites:**
+1. Install [Python 3.11+](https://python.org/downloads) ✓ "Add Python to PATH"
+2. Install [Git for Windows](https://git-scm.com/download/win)
+3. Install [Chrome](https://www.google.com/chrome/) (required for cookies)
+
+```powershell
+# Open PowerShell as Administrator
+
+# 1. Install Python packages
+pip install instaloader browser-cookie3
+
+# 2. Clone repository
+git clone https://github.com/hanyxd/osgr-tool
+cd osgr-tool
+
+# 3. Run with python (no chmod needed on Windows)
+python osgr nasa --analytics --stories --save
+
+# 4. Optional: Add to PATH for global 'osgr' command
+# Copy osgr to a folder in your PATH, or create a batch wrapper:
+echo python "%~dp0osgr" %* > C:\Windows\osgr.bat
+# Now you can run: osgr nasa --analytics
+```
+
+#### Option B: WSL2 (Windows Subsystem for Linux) — **Recommended**
+
+WSL2 gives you full Linux compatibility:
+
+```powershell
+# 1. Enable WSL2 (run in PowerShell Admin)
+wsl --install
+# Restart computer, then open Ubuntu from Start menu
+
+# 2. Inside Ubuntu terminal, follow Linux (Debian/Ubuntu) instructions above:
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv git chromium-browser
+pip3 install instaloader browser-cookie3
+git clone https://github.com/hanyxd/osgr-tool
+cd osgr-tool
+chmod +x osgr
+sudo ln -s $(pwd)/osgr /usr/local/bin/osgr
+
+# 3. Login to Chrome INSIDE WSL (or use Windows Chrome with cookie sharing)
+# For Windows Chrome cookie access, install browser-cookie3 with Windows support:
+pip install browser-cookie3[windows]
+```
+
+**WSL2 + Windows Chrome Cookie Access:**
+```bash
+# In WSL, point to Windows Chrome cookie database
+export CHROME_COOKIE_PATH="/mnt/c/Users/YOUR_USERNAME/AppData/Local/Google/Chrome/User Data/Default/Network/Cookies"
+# osgr will auto-detect if browser-cookie3[windows] is installed
+```
+
+---
+
+### macOS (Intel & Apple Silicon)
 
 ```bash
-# Basic profile + highlights
+# 1. Install Homebrew (if not installed)
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# 2. Install dependencies
+brew install python3 git chromium
+
+# 3. Python packages
+pip3 install instaloader browser-cookie3
+
+# 4. Clone & install
+git clone https://github.com/hanyxd/osgr-tool
+cd osgr-tool
+chmod +x osgr
+sudo ln -s $(pwd)/osgr /usr/local/bin/osgr
+
+# 5. Login to Chrome on macOS, then run
+osgr nasa --analytics --stories --save
+```
+
+---
+
+## 🐳 Docker (Any Platform)
+
+```bash
+# Build image
+git clone https://github.com/hanyxd/osgr-tool
+cd osgr-tool
+
+# Create Dockerfile
+cat > Dockerfile << 'EOF'
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y chromium git && rm -rf /var/lib/apt/lists/*
+RUN pip install instaloader browser-cookie3
+WORKDIR /app
+COPY . .
+RUN chmod +x osgr
+ENTRYPOINT ["python", "osgr"]
+EOF
+
+docker build -t osgr .
+# Run (need to mount Chrome cookie dir)
+docker run -it --rm \
+  -v ~/osgr_output:/root/osgr_output \
+  -v ~/.config/chromium:/root/.config/chromium:ro \
+  osgr nasa --analytics --stories --save
+```
+
+---
+
+## 🔧 Browser Cookie Configuration
+
+| Browser | Linux Path | Windows Path | macOS Path |
+|---------|------------|--------------|------------|
+| Chrome | `~/.config/google-chrome/Default/Cookies` | `%LOCALAPPDATA%\Google\Chrome\User Data\Default\Network\Cookies` | `~/Library/Application Support/Google/Chrome/Default/Cookies` |
+| Chromium | `~/.config/chromium/Default/Cookies` | `%LOCALAPPDATA%\Chromium\User Data\Default\Network\Cookies` | `~/Library/Application Support/Chromium/Default/Cookies` |
+| Brave | `~/.config/BraveSoftware/Brave-Browser/Default/Cookies` | `%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\Default\Network\Cookies` | `~/Library/Application Support/BraveSoftware/Brave-Browser/Default/Cookies` |
+| Edge | `~/.config/microsoft-edge/Default/Cookies` | `%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\Network\Cookies` | `~/Library/Application Support/Microsoft Edge/Default/Cookies` |
+
+**Auto-detection works for Chrome/Chromium/Brave/Edge on all platforms.**
+
+For non-default profiles, set environment variable:
+```bash
+export BROWSER_COOKIE3_CHROME_PROFILE="Profile 2"
+osgr nasa --analytics
+```
+
+---
+
+## 🚀 Running Examples
+
+```bash
+# Quick profile scan
 osgr nasa
 
-# Profile + active stories
-osgr nasa --stories
+# Full OSINT package with exports
+osgr target_username --full --save
 
-# Full analysis with exports
+# Just analytics + stories
 osgr nasa --analytics --stories --save
 
-# Deep investigation
-osgr target --full --save
+# Follower network mapping
+osgr target --followers 200 --following 200 --csv
 
-# Get 100 followers + 50 following
-osgr target --followers 100 --following 50 --csv
+# Post engagement deep-dive
+osgr target --posts 50 --analytics --verbose
 
-# Get likers for last 5 posts (must follow target first)
-osgr target --likes 5 --save
+# Likers analysis (MUST follow target first in Chrome!)
+osgr target --likes 10 --save
 
-# Raw JSON for piping
-osgr target --json | jq '.profile.followers'
+# JSON for scripting
+osgr target --json | jq '.profile | {username, followers, following, posts_count}'
 ```
 
-## Output Files
+---
 
-Saved to `~/osgr_output/`:
-- `username_TIMESTAMP.json` — Complete structured data
-- `username_posts.csv` — Posts with all metadata
-- `username_highlights.csv` — Story highlights flattened
-- `username_followers.csv` — Follower sample
-- `username_report.md` — Human-readable Markdown report
+## 📁 Output Structure
 
-## Requirements
+```
+~/osgr_output/
+├── target_20260711_143022.json      # Full JSON data
+├── target_posts.csv                  # Posts (shortcode, likes, comments, hashtags, etc.)
+├── target_highlights.csv             # Story highlights
+├── target_followers.csv              # Follower sample
+├── target_following.csv              # Following sample
+├── target_likes.csv                  # Post likers
+└── target_report.md                  # Human-readable report
+```
 
-- Python 3.8+
-- `instaloader` — `pip install instaloader`
-- `browser-cookie3` — `pip install browser-cookie3`
-- Chrome browser (for session cookies)
-- Instagram account (use burner!)
+---
 
-## Legal & Ethics
+## ⚠️ Important Notes
 
-- **Educational/OSINT purposes only**
-- Use burner accounts — Instagram may challenge/lock automation
-- Respect rate limits and terms of service
-- Don't use on private accounts without permission
-- Check local laws regarding data collection
+| Platform | Notes |
+|----------|-------|
+| **All** | Use **burner Instagram account** — automation triggers challenges |
+| **Windows** | Run PowerShell as Admin for `ln -s` equivalent; WSL2 preferred |
+| **Linux** | Chrome/Chromium must be installed for cookie extraction |
+| **macOS** | Grant Terminal "Full Disk Access" in System Preferences → Security for cookie reading |
+| **Docker** | Mount host Chrome cookie directory for authentication |
+
+---
+
+## 📋 Requirements Summary
+
+| Component | Linux | Windows | macOS |
+|-----------|-------|---------|-------|
+| Python | 3.8+ | 3.11+ | 3.8+ |
+| pip packages | `instaloader`, `browser-cookie3` | Same | Same |
+| Browser | Chrome/Chromium/Brave/Edge | Chrome/Edge | Chrome/Brave/Edge |
+| Git | ✓ | ✓ | ✓ |
+| Shell | bash/zsh/fish | PowerShell/WSL2 | bash/zsh |
+
+---
 
 ## License
 
-MIT
+MIT — Use responsibly for educational/OSINT purposes only.
