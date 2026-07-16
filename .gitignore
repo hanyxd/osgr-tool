@@ -2,4 +2,6 @@
 *
 !/osgr_tool/
 !/osgr_tool/**
+!/README.md
+!/LICENSE
 !/.gitignore
