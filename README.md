@@ -1,53 +1,148 @@
-#  I Strongly Recommend Using The Website. Otherwise below are extra details for development
+# osgr - Instagram OSINT Reconnaissance Tool
 
-[![GitHub Downloads](https://img.shields.io/github/downloads/DLindustries/System/total?style=flat-square&color=8a2be2)](https://github.com/DLindustries/System/releases)
-[![GitHub Issues](https://img.shields.io/github/issues/DLindustries/System?style=flat-square&color=8a2be2)](https://github.com/DLindustries/System/issues)
-[![License](https://img.shields.io/badge/license-GPL--3.0-8a2be2?style=flat-square)](https://www.gnu.org/licenses/gpl-3.0.en.html)
+[![GitHub Release](https://img.shields.io/github/v/release/hanyxd/osgr?style=flat-square&color=8a2be2)](https://github.com/hanyxd/osgr/releases)
+[![GitHub Downloads](https://img.shields.io/github/downloads/hanyxd/osgr/total?style=flat-square&color=8a2be2)](https://github.com/hanyxd/osgr/releases)
+[![GitHub Issues](https://img.shields.io/github/issues/hanyxd/osgr?style=flat-square&color=8a2be2)](https://github.com/hanyxd/osgr/issues)
+[![License](https://img.shields.io/badge/license-MIT-8a2be2?style=flat-square)](LICENSE)
+[![Python Version](https://img.shields.io/badge/python-3.11+-8a2be2?style=flat-square&logo=python&logoColor=white)](https://python.org)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-8a2be2?style=flat-square)](https://github.com/hanyxd/osgr)
+[![Discord](https://img.shields.io/badge/Discord-Join%20Server-8a2be2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/yynpznJVkC)
 
-<a href="https://discord.gg/yynpznJVkC"><img src="https://invidget.switchblade.xyz/yynpznJVkC" alt="Discord Invite"/></a>
-
-> **🌐 Full website for non devs here:** [dlindustries.uk](https://dlindustries.uk)
+> **🌐 Web Version Available:** [osgr.dev](https://osgr.dev) — Recommended for non-developers
 
 ---
 
-## Issues
+## Overview
 
-If you notice any bugs or missing features, you can let us know by opening an issue [here](https://github.com/DLindustries/System/issues).
+**osgr** (OSINT Instagram Reconnaissance) is a powerful command-line tool for Instagram open-source intelligence gathering. Built for security researchers, penetration testers, and OSINT investigators.
 
-## License
+### Features
 
-This project is subject to the [GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.en.html). This does only apply for source code located directly in this clean repository. During the development and compilation process, additional source code may be used to which we have obtained no rights. Such code is not covered by the GPL license.
+- 🔍 **Profile Enumeration** — Extract public profile metadata, bio, followers/following counts
+- 📸 **Media Analysis** — Download and analyze posts, stories, reels, highlights
+- 👥 **Social Graph Mapping** — Followers, following, mutual connections, interaction analysis
+- 🔍 **OSINT Enrichment** — Email/phone extraction, linked accounts, metadata extraction
+- 📊 **Export Formats** — JSON, CSV, HTML reports, GraphML for graph visualization
+- 🔐 **Session Management** — Session persistence, cookie rotation, rate-limit handling
+- 🔌 **Modular Architecture** — Plugin system for custom extractors and exporters
 
-For those who are unfamiliar with the license, here is a summary of its main points. This is by no means legal advice nor legally binding.
+---
 
-**Actions that you are allowed to do:**
+## Installation
 
-- Use
-- Share
-- Modify
+### Quick Install (Linux/macOS)
+```bash
+curl -fsSL https://raw.githubusercontent.com/hanyxd/osgr/main/install.sh | bash
+```
 
-**If you do decide to use ANY code from the source:**
+### From Source
+```bash
+git clone https://github.com/hanyxd/osgr.git
+cd osgr
+pip install -e .
+```
 
-- **You must disclose the source code of your modified work and the source code you took from this project. This means you are not allowed to use code from this project (even partially) in a closed-source (or even obfuscated) application.**
-- **Your modified application must also be licensed under the GPL.**
+### Requirements
+- Python 3.11+
+- Linux, macOS, or Windows (WSL2 recommended)
+- Valid Instagram session (cookies/sessionid)
 
-## Developing System
+---
 
-System uses Gradle to build the client. Install the latest version of Gradle onto your computer and install IntelliJ IDEA Ultimate, or use the free community edition.
+## Quick Start
 
-1. Clone the repository using `git clone --recurse-submodules https://github.com/DLindustries/System`.
-2. CD into the local repository with the command `cd System`.
-3. Run `./gradlew genSources`.
-4. Open the folder in IntelliJ — feel free to recode the client.
-5. To build, simply run `./gradlew build` or create a run configuration for Gradle with the build command.
-6. Enjoy System! :D
+```bash
+# Interactive session setup
+osgr auth login
 
-## Addition info
+# Profile enumeration
+osgr profile target_username --output json
 
-For those who are saying skid this IS a repaste of argon with extended utillities and improved modules to reduce anticheat flags on grim
+# Download all media
+osgr media target_username --all --output ./downloads
+
+# Follower analysis
+osgr followers target_username --graph graphml --output network.graphml
+
+# Full OSINT report
+osgr recon target_username --full --report html --output report.html
+```
+
+---
+
+## Documentation
+
+| Topic | Link |
+|-------|------|
+| **Installation Guide** | [docs/installation.md](docs/installation.md) |
+| **CLI Reference** | [docs/cli-reference.md](docs/cli-reference.md) |
+| **Configuration** | [docs/configuration.md](docs/configuration.md) |
+| **Plugin Development** | [docs/plugins.md](docs/plugins.md) |
+| **API Reference** | [docs/api-reference.md](docs/api-reference.md) |
+
+---
+
+## Configuration
+
+Configuration file: `~/.config/osgr/config.yaml`
+
+```yaml
+instagram:
+  sessionid: "your_session_id"
+  csrftoken: "your_csrf_token"
+  user_agent: "Instagram 300.0.0.0.0 Android"
+  
+rate_limits:
+  requests_per_minute: 30
+  delay_range: [2, 5]
+  
+output:
+  default_format: "json"
+  default_dir: "~/osgr_output"
+```
+
+---
 
 ## Contributing
 
-We appreciate contributions. So if you want to support us, feel free to make changes to System's source code and submit a pull request
+We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
 
-TY enjoy System
+### Quick Contribution Guide
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feat/amazing-feature`
+3. Make your changes with tests
+4. Run linting: `make lint`
+5. Submit a Pull Request
+
+---
+
+## Code of Conduct
+
+Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before participating.
+
+---
+
+## License
+
+This project is licensed under the **MIT License** — see [LICENSE](LICENSE) for details.
+
+---
+
+## Support
+
+- **Issues:** [GitHub Issues](https://github.com/hanyxd/osgr/issues)
+- **Discord:** [Join our server](https://discord.gg/yynpznJVkC)
+- **Security:** Report vulnerabilities to security@osgr.dev
+
+---
+
+## Acknowledgments
+
+Built with inspiration from [Osintgram](https://github.com/Datalux/Osintgram), [Instaloader](https://instaloader.github.io/), and the OSINT community.
+
+---
+
+<p align="center">
+  <strong>Built for OSINT researchers, by OSINT researchers</strong>
+</p>
